@@ -1,2 +1,2 @@
-# Tiga-TLA-
+# Tiga-TLA+
 The TLA+ Spec for Tiga
