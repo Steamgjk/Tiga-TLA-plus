@@ -1465,7 +1465,7 @@ ReleaseSeqeuncer(serverId, currentTime) ==
         /\ vDeadlineQuorum' = [
             vDeadlineQuorum EXCEPT ![serverId]
                 = { msg \in vDeadlineQuorum[serverId]: 
-                    \A txn \in releaseTxns: txn.txnId # msg.txnId}
+                    \A txn \in releaseTxns: txn.txnId # msg.entry.txnId}
             ]
         \* Append to log
         /\ vLog' = [vLog EXCEPT ![serverId] = vLog[serverId] \o releaseSeq ]
