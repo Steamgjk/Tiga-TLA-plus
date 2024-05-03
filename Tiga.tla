@@ -405,9 +405,6 @@ VARIABLES
             (* vLCommitPoint indicates that the log entries before this point has been locally committed, i.e., replicated to majority in this sharding groups. So followers can safely execute the logged txns 
             *)
             vLCommitPoint, 
-            (* vPeerCommitDeadline records the peer's largest deadline that has been locally committed. This can be used to save data transfer during cross-shard confirmation
-            *)
-            vPeerCommitDeadline,   
             (* vLSyncQuorum is used by each leader to collect the LocalSyncStatus messages from servers in the same sharding group 
             *)
             vLSyncQuorum,  
@@ -461,9 +458,8 @@ serverStateVars ==
     vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
     vGView, vGVec, vLView, vServerClock, vLastNormView, 
     vViewChange, vLSyncPoint, vLCommitPoint, 
-    vPeerCommitDeadline, vLSyncQuorum,
-    vUUIDCounter, vCrashVector, vCrashVectorReps, 
-    vRecoveryReps, vServerProcessed>>
+    vLSyncQuorum,vUUIDCounter, vCrashVector, 
+    vCrashVectorReps, vRecoveryReps, vServerProcessed>>
 
 coordStateVars == <<vCoordClock, vCoordTxns, vCoordProcessed>>
 
@@ -494,9 +490,6 @@ InitServerState ==
     /\  vViewChange = [ serverId \in Servers |-> {} ]
     /\  vLSyncPoint   = [ serverId \in Servers |-> 0 ]
     /\  vLCommitPoint   = [ serverId \in Servers |-> 0 ]
-    /\  vPeerCommitDeadline   = [ serverId \in Servers |->  
-            [shardId \in Shards |-> 0 ]
-        ]
     /\  vLSyncQuorum    = [ serverId \in Servers |-> {} ]
     /\  vUUIDCounter = [ serverId \in Servers |-> 0 ]
     /\  vCrashVector = [ 
@@ -1201,7 +1194,6 @@ ResetServerState(serverId) ==
     /\  vViewChange' =[vViewChange EXCEPT ![serverId] = {}]
     /\  vLSyncPoint' = [ vLSyncPoint EXCEPT ![serverId] = 0 ]
     /\  vLCommitPoint' = [ vLCommitPoint EXCEPT ![serverId] = 0 ]
-    /\  vPeerCommitDeadline' = [ vPeerCommitDeadline EXCEPT ![serverId] = 0]
     /\  vLSyncQuorum' = [ vLSyncQuorum EXCEPT ![serverId] = {} ]
     /\  vCrashVector' = [vCrashVector EXCEPT ![serverId] = [
             rr \in Replicas |->0
@@ -1502,10 +1494,8 @@ ServerClockMove(serverId) ==
         /\  UNCHANGED << vCrossShardVerifyReps,
                 vServerStatus, vGView, vGVec, vLView, vLastNormView,
                 vViewChange, vLSyncPoint, vLCommitPoint, 
-                vPeerCommitDeadline, vLSyncQuorum,
-                vUUIDCounter, vCrashVector, vCrashVectorReps, 
-                vRecoveryReps, vServerProcessed >>
-
+                vLSyncQuorum,vUUIDCounter, vCrashVector, 
+                vCrashVectorReps,vRecoveryReps, vServerProcessed >>
 
 
 CoordClockMove(coordId) ==  
@@ -1546,8 +1536,7 @@ Next ==
             vServerStatus, vGView, vGVec,
             vLView, vServerClock, vLastNormView, 
             vViewChange, vLSyncPoint, vLCommitPoint,  
-            vPeerCommitDeadline, vLSyncQuorum, 
-            vUUIDCounter, vCrashVector, 
+            vLSyncQuorum, vUUIDCounter, vCrashVector, 
             vCrashVectorReps, vRecoveryReps>>
         /\ ActionName' = <<"HandleTxn">>
 
@@ -1559,13 +1548,10 @@ Next ==
             vServerProcessed[m.dest] \cup {m} ]
         /\ HandleDeadlineNotification(m)
         /\ UNCHANGED  << networkVars, coordStateVars, configManagerStateVars, 
-                vLog, vCrossShardVerifyReps, vLateBuffer, 
-                vServerStatus, vGView, vGVec,
-                vLView, vServerClock, vLastNormView, 
-                vViewChange, vLSyncPoint, vLCommitPoint, 
-                vPeerCommitDeadline, vLSyncQuorum,
-                vUUIDCounter, vCrashVector, vCrashVectorReps, 
-                vRecoveryReps>>
+                vLog, vCrossShardVerifyReps, vLateBuffer, vServerStatus, 
+                vGView, vGVec, vLView, vServerClock, vLastNormView, 
+                vViewChange, vLSyncPoint, vLCommitPoint, vLSyncQuorum, 
+                vUUIDCounter, vCrashVector, vCrashVectorReps, vRecoveryReps>>
         /\ ActionName' = <<"HandleDeadlineNotification">>
 
     \/ \E m \in messages:
@@ -1577,9 +1563,9 @@ Next ==
         /\ HandleInterReplicaSync(m)
         /\ UNCHANGED << coordStateVars, configManagerStateVars,
                 vLog,  vCrossShardVerifyReps, vLateBuffer, 
-                vServerStatus, vGView, vGVec,
-                vLView, vServerClock, vLastNormView, 
-                vViewChange, vLCommitPoint, vPeerCommitDeadline, 
+                vServerStatus, vGView, vGVec, vLView, 
+                vServerClock, vLastNormView, 
+                vViewChange, vLCommitPoint, 
                 vLSyncQuorum, vUUIDCounter, vCrashVector, 
                 vCrashVectorReps, vRecoveryReps>>                    
         /\ ActionName' = <<"HandleInterReplicaSync">>
@@ -1592,12 +1578,10 @@ Next ==
         /\ vServerStatus[serverId] = StNormal
         /\ StartLeaderFail(serverId)
         /\ UNCHANGED << networkVars, coordStateVars, configManagerStateVars, 
-            vLog, vEarlyBuffer, vLateBuffer, 
-            vDeadlineQuorum, vCrossShardVerifyReps, vGView, vGVec, 
-            vLView, vServerClock, vLastNormView, 
-            vViewChange, vLSyncPoint, vLCommitPoint, 
-            vPeerCommitDeadline, vLSyncQuorum,
-            vUUIDCounter, vCrashVector, vCrashVectorReps, 
+            vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
+            vCrossShardVerifyReps, vGView, vGVec, vLView, vServerClock, 
+            vLastNormView, vViewChange, vLSyncPoint, vLCommitPoint, 
+            vLSyncQuorum, vUUIDCounter, vCrashVector, vCrashVectorReps, 
             vRecoveryReps, vServerProcessed>>
         /\ ActionName' = << "StartLeaderFail" >>
 
@@ -1651,8 +1635,8 @@ Next ==
         /\  HandleViewChangeReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vServerClock, vViewChange, vLSyncPoint, 
-                vLCommitPoint, vLSyncQuorum, vPeerCommitDeadline, 
-                vUUIDCounter, vCrashVector, vCrashVectorReps, vRecoveryReps >>
+                vLCommitPoint, vLSyncQuorum, vUUIDCounter, 
+                vCrashVector, vCrashVectorReps, vRecoveryReps >>
         /\ ActionName' = << "HandleViewChangeReq" >>
 
 
@@ -1667,9 +1651,8 @@ Next ==
         /\  HandleViewChange(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vGVec, vServerClock, vLSyncPoint, vLastNormView,
-                vLCommitPoint, vPeerCommitDeadline, vLSyncQuorum,
-                vUUIDCounter, vCrashVector, vCrashVectorReps, 
-                vRecoveryReps >>
+                vLCommitPoint, vLSyncQuorum, vUUIDCounter, 
+                vCrashVector, vCrashVectorReps, vRecoveryReps >>
         /\ ActionName' = << "HandleViewChange" >>
 
     \/  \E m \in messages:
@@ -1683,8 +1666,7 @@ Next ==
                 vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
                 vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
-                vViewChange, vLSyncPoint, vLCommitPoint, 
-                vPeerCommitDeadline, vLSyncQuorum,
+                vViewChange, vLSyncPoint, vLCommitPoint, vLSyncQuorum,
                 vUUIDCounter, vCrashVector, vCrashVectorReps, 
                 vRecoveryReps>>
         /\ ActionName' = << "HandleCrossShardVerifyReq" >>
@@ -1701,9 +1683,8 @@ Next ==
                 vEarlyBuffer, vLateBuffer, vDeadlineQuorum, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, 
-                vPeerCommitDeadline, vLSyncQuorum,
-                vUUIDCounter, vCrashVector, vCrashVectorReps, 
-                vRecoveryReps>>
+                vLSyncQuorum, vUUIDCounter, vCrashVector, 
+                vCrashVectorReps, vRecoveryReps>>
         /\ ActionName' = << "HandleCrossShardVerifyRep" >>
 
     \/  \E m \in messages:
@@ -1715,7 +1696,7 @@ Next ==
         /\  vServerStatus[m.dest] # StFailing
         /\  HandleStartView(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                    vServerClock,vLCommitPoint, vPeerCommitDeadline, 
+                    vServerClock,vLCommitPoint, 
                     vUUIDCounter, vCrashVector >>
         /\ ActionName' = << "HandleStartView" >>
 
@@ -1737,10 +1718,9 @@ Next ==
         /\  HandleCrashVectorReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
-                vCrossShardVerifyReps, vServerStatus, 
-                vGView, vGVec,vLView, vServerClock, vLastNormView, 
-                vViewChange, vLSyncPoint, vLCommitPoint, 
-                vPeerCommitDeadline, vLSyncQuorum, vUUIDCounter, 
+                vCrossShardVerifyReps, vServerStatus, vGView, vGVec,
+                vLView, vServerClock, vLastNormView, vViewChange, 
+                vLSyncPoint, vLCommitPoint, vLSyncQuorum, vUUIDCounter, 
                 vCrashVector, vCrashVectorReps, vRecoveryReps >>
         /\ ActionName' = << "HandleCrashVectorReq" >>
 
@@ -1755,8 +1735,7 @@ Next ==
                 vLog, vEarlyBuffer, vLateBuffer, 
                 vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
-                vViewChange, vLSyncPoint, vLCommitPoint, 
-                vPeerCommitDeadline, vLSyncQuorum,
+                vViewChange, vLSyncPoint, vLCommitPoint,vLSyncQuorum,
                 vUUIDCounter, vCrashVectorReps, vRecoveryReps >>
         /\ ActionName' = << "HandleCrashVectorRep" >>
 
@@ -1772,8 +1751,7 @@ Next ==
                 vLog, vEarlyBuffer, vLateBuffer, 
                 vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
-                vViewChange, vLSyncPoint, vLCommitPoint, 
-                vPeerCommitDeadline, vLSyncQuorum,
+                vViewChange, vLSyncPoint, vLCommitPoint, vLSyncQuorum,
                 vUUIDCounter, vCrashVectorReps, vRecoveryReps >>
         /\ ActionName' = << "HandleRecoveryReq" >>
 
@@ -1788,9 +1766,8 @@ Next ==
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vEarlyBuffer, vLateBuffer, 
                 vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
-                vGVec, vServerClock, vLastNormView, 
-                vViewChange, vLSyncPoint, vLCommitPoint, 
-                vPeerCommitDeadline, vLSyncQuorum,
+                vGVec, vServerClock, vLastNormView, vViewChange, 
+                vLSyncPoint, vLCommitPoint, vLSyncQuorum,
                 vUUIDCounter, vCrashVectorReps, vRecoveryReps >>
         /\ ActionName' = << "HandleRecoveryRep" >>
 
@@ -1807,7 +1784,7 @@ Next ==
                 vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, 
                 vLastNormView, vViewChange, vLSyncPoint, 
-                vLCommitPoint, vPeerCommitDeadline, vLSyncQuorum,
+                vLCommitPoint, vLSyncQuorum,
                 vUUIDCounter, vCrashVector, 
                 vCrashVectorReps, vRecoveryReps >>
         /\ ActionName' = << "HandleStartViewReq" >>
@@ -1829,12 +1806,11 @@ Next ==
         /\  isCrashVectorValid(m)
         /\  HandleLocalSyncStatus(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, 
-                vDeadlineQuorum, vCrossShardVerifyReps, 
-                vServerClock, vViewChange, vGVec, vGView, 
-                vLSyncPoint, vLView, vLastNormView,
-                vServerStatus, vPeerCommitDeadline,
-                vUUIDCounter, vCrashVectorReps, vRecoveryReps >>
+                vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
+                vCrossShardVerifyReps, vServerClock, vViewChange, 
+                vGVec, vGView, vLSyncPoint, vLView, vLastNormView,
+                vServerStatus,vUUIDCounter, vCrashVectorReps, 
+                vRecoveryReps >>
         /\ ActionName' = << "HandleLocalSyncStatus" >>
 
 
@@ -1849,11 +1825,9 @@ Next ==
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 networkVars, vLog, vEarlyBuffer, vLateBuffer, 
                 vDeadlineQuorum, vCrossShardVerifyReps, 
-                vServerStatus, vServerClock, 
-                vGView, vGVec, vLView, vLastNormView, 
-                vViewChange, vLSyncPoint, vPeerCommitDeadline, 
-                vLSyncQuorum, vUUIDCounter, 
-                vCrashVectorReps, vRecoveryReps >>
+                vServerStatus, vServerClock, vGView, vGVec, 
+                vLView, vLastNormView, vViewChange, vLSyncPoint, 
+                vLSyncQuorum, vUUIDCounter, vCrashVectorReps, vRecoveryReps >>
         /\ ActionName' = << "HandleLocalCommit" >>
 
 
@@ -1869,9 +1843,8 @@ Next ==
             vCoordTxns, vCoordProcessed >>
         /\ ActionName' = << "CoordClockMove">>
 
-Spec == Init /\ [][Next]_<<networkVars, 
-                        serverStateVars, coordStateVars, configManagerStateVars,
-                        ActionName>>
+Spec == Init /\ [][Next]_<<networkVars,serverStateVars, coordStateVars, 
+                        configManagerStateVars,ActionName>>
 
 
 ShardRecovered(shardId, lViewID) ==  
