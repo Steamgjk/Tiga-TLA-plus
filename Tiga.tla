@@ -58,7 +58,8 @@ FastQuorums == {R \in SUBSET(Replicas) :
 Quorums == {R \in SUBSET(Replicas) : 
                 Cardinality(R) * 2 > Cardinality(Replicas)}   
 
-\* Server Statuses (Within Shard)
+
+(* `^\textbf{\large Server Status}^' *)
 StNormal == 1
 StViewChange == 2
 StCrossShardSyncing == 3
@@ -66,7 +67,7 @@ StRecovering == 4
 StFailing == 5
 
 
-\* Message Types
+(* `^\textbf{\large Message Types}^' *)
 MTxn == 1
 MLogEntry == 2  \* Log entry, different from index, it includes command field, which can be large in practice
 MDeadlineNotification == 3 \* Leaders send the message to other leaders for deadline agreement
@@ -97,10 +98,7 @@ MStartViewReq == 17
 MCrossShardVerifyReq == 18
 MCrossShardVerifyRep == 19
 
-(* 
-    Config Manager (CM)'s operations
-
-    Since CM is supported by typical viewstamped replication (VR),  in this spec, we do not repeat the VR's failure recovery spec for CM
+(*  Config Manager (CM)'s Operations. Since CM is supported by typical viewstamped replication (VR),  in this spec, we do not repeat the VR's failure recovery spec for CM
 *)
 MCMPrepare == 20
 MCMPrepareReply == 21
@@ -109,7 +107,7 @@ MCMCommit == 22
 
 
 (*
-  `^\textbf{Message Schemas}^'
+  `^\textbf{\large Message Schemas}^'
 
     Each server is identified by a combination of <replicaId, shardId>
     TxnID uniquely identifies one request on one server
@@ -357,10 +355,6 @@ MCMCommit == 22
 
 \* `^\textbf{Network State}^'
 
-\* The variables record the messages processed by Replicas/Clients, so 
-\* that the Replicas/Clients will not process twice
-
-
 VARIABLES messages \* Set of all messages sent
 
 \* `^\textbf{Server State}^'
@@ -440,12 +434,15 @@ VARIABLES   (* Current Clock Time of the coordinator*)
             vCoordProcessed
 
 
+
 \* `^\textbf{Configuration Manager (CM) State}^'
-VARIABLES   (* Since CM is supported by traditional VR, here we do not want to repeat VR's failure recovery in this spec, so we make CMStatus always StNormal
+
+VARIABLES   
+            (* Since CM is supported by traditional VR, here we do not want to repeat VR's failure recovery in this spec, so we make CMStatus always StNormal
             *)
             vCMStatus, 
             vCMView,
-            (* Config Manager: the latest global info the manager maintains (including gView and gVec)
+            (* Config Manager: the latest global info the manager maintains (gView and gVec)
             *)
             vCMGInfo,
             vCMPrepareGInfo,
@@ -455,11 +452,7 @@ VARIABLES   (* Since CM is supported by traditional VR, here we do not want to r
 
             vCMProcessed
 
-
 VARIABLES  ActionName
-
-
-
 
 networkVars == << messages >>
 
@@ -633,7 +626,6 @@ ASSUME
  *)  
 
 
-\* `^\textbf{Client action}^'
 
 (* Coordinator c submits a txn. We assume Coordinator can only send one txn in one tick of time. If time has reached the bound, this client cannot send request any more
 *)
@@ -821,7 +813,6 @@ StartLeaderFail(serverId) ==
     ELSE    UNCHANGED <<vServerStatus>>
 
 
-
 DetectLeaderFail(cmReplicaId) ==
     \E shardId \in Shards:
         LET 
@@ -875,6 +866,7 @@ LaunchViewChange(cmReplicaId) ==
         PrepareViewChange(cmReplicaId)
     ELSE 
         UNCHANGED  << networkVars >>
+
 
 
 
@@ -1495,6 +1487,7 @@ ReleaseSeqeuncer(serverId, currentTime) ==
             ]: dstServerId \in serversInOneShard })
 
 
+
 ServerClockMove(serverId) == 
     IF  vServerClock[serverId] >= MaxTime   THEN 
         UNCHANGED  <<networkVars, serverStateVars>>
@@ -1512,6 +1505,7 @@ ServerClockMove(serverId) ==
                 vPeerCommitDeadline, vLSyncQuorum,
                 vUUIDCounter, vCrashVector, vCrashVectorReps, 
                 vRecoveryReps, vServerProcessed >>
+
 
 
 CoordClockMove(coordId) ==  
@@ -1607,7 +1601,7 @@ Next ==
             vRecoveryReps, vServerProcessed>>
         /\ ActionName' = << "StartLeaderFail" >>
 
-    \* configManager notices some leader(s) fail and launch view change
+    \* Config Manager notices some leader(s) fail and launch view change
     \/  \E cmReplicaId \in Replicas:
         /\  LaunchViewChange(cmReplicaId)
         /\  UNCHANGED  << coordStateVars, serverStateVars, configManagerStateVars >>
