@@ -94,7 +94,8 @@ MCrashVectorRep == 14
 MRecoveryReq == 15
 MRecoveryRep == 16
 MStartViewReq == 17
-MCrossShardConfirm == 19
+MCrossShardVerifyReq == 18
+MCrossShardVerifyRep == 19
 
 (* 
     Config Manager (CM)'s operations
@@ -202,19 +203,32 @@ MCMCommit == 22
         dest        |-> dst \in Servers,
         gView       |-> 0..x
         gVec        |-> the lViews for each shard
-        lView       |-> 0...x
+        lView       |-> 0..x
         lastNormal  |-> v \in ViewIDs,
         lSyncPoint  |-> 0..
         entries     |-> l \in vLogs[1..n],
         cv          |-> crash vector  
     ]
 
-    CrossShardConfirm = [ 
-        mtype      |-> MCrossShardConfirm,
+    Tell the leaders in other sharding groups my syncPoint
+
+    MCrossShardVerifyReq = [ 
+        mtype      |-> MCrossShardVerifyReq,
         sender     |-> src \in Servers,
         dest       |-> dst \in Servers,
-        lView      |-> 0...x
-        gView      |-> 0...
+        lView      |-> 0..x
+        gView      |-> 0..x
+        syncedDdl  |-> The largest deadline of the synced entries
+    ]
+
+    Reply the entries to the other leaders. These entries' log positions are beyond the syncPoint of the receiving leader, so that the receiving leader can verify whether it needs deadline agreement for the txn, or even misses the txn 
+
+    MCrossShardVerifyRep = [ 
+        mtype      |-> MCrossShardVerifyRep,
+        sender     |-> src \in Servers,
+        dest       |-> dst \in Servers,
+        lView      |-> 0..x
+        gView      |-> 0..x
         entries    |-> l \in vLogs[1..n]
     ]
 
@@ -279,7 +293,7 @@ MCMCommit == 22
         sender      |-> src \in Servers,
         dest        |-> dst \in Servers,
         lView       |-> 0...x
-        lSyncPoint  |-> n \in (1..) 
+        lSyncPoint  |-> 1.. 
         cv          |-> vector of counters
     ]
 
@@ -296,6 +310,7 @@ MCMCommit == 22
 
     Each server tells its neighbors (the servers in the same region but belong to different shards) its local commit status. This is optional optimization (only for checkpoint and failure recovery acceleration)
     
+    \* maybe obsolete
     PeerShardCommitStatus =[ 
         mtype       |-> MPeerShardCommitStatus,
         sender      |-> src \in Servers,
@@ -365,10 +380,8 @@ VARIABLES
             (* Each leader server has a data structure of DeadlineQuroum to collect the deadlines from other servers for agreement 
             *)
             vDeadlineQuorum,
-            (* After servers have recovered their logs from the signle shard, they need confirmation from the other shards to ensure the recovered logs satisfy strict serializability
-            *)
-            vCrossShardConfirmQuorum,
-            (* One of StNormal, StViewChange, StFailing, StRecovering  
+
+            (* One of StNormal, StViewChange, StFailing, StCrossShardSyncing, StRecovering  
             *)
             vServerStatus,
             (* Global views of each server 
@@ -389,6 +402,9 @@ VARIABLES
             (* Used for collecting view change votes 
             *)
             vViewChange,  
+            (* Used for collecting CrossShardVerify replies. After the leader have recovered their logs for its own shard, they need verify from the other shards to ensure the recovered logs satisfy strict serializability, i.e., every log has commonly-agreed deadlines across sharding groups. 
+            *)
+            vCrossShardVerifyReps,
             (* vLSyncPoint indicates to which the server state (vLog) is consistent with the leader.  
             *)
             vLSyncPoint,
@@ -449,7 +465,7 @@ networkVars == << messages >>
 
 serverStateVars == 
     << vLog, vEarlyBuffer, vLateBuffer, 
-    vDeadlineQuorum, vCrossShardConfirmQuorum, vServerStatus, 
+    vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
     vGView, vGVec, vLView, vServerClock, vLastNormView, 
     vViewChange, vLSyncPoint, vLCommitPoint, 
     vPeerCommitDeadline, vLSyncQuorum,
@@ -471,7 +487,7 @@ InitServerState ==
     /\  vEarlyBuffer   = [ serverId \in Servers |-> {} ]
     /\  vLateBuffer   = [ serverId \in Servers |-> {} ]
     /\  vDeadlineQuorum  =   [ serverId \in Servers |-> {} ]
-    /\  vCrossShardConfirmQuorum = [ serverId \in Servers |-> {} ]
+    /\  vCrossShardVerifyReps = [ serverId \in Servers |-> {} ]
     /\  vServerStatus    =   [ serverId \in Servers |-> StNormal ]
     /\  vGView  =   [ serverId \in Servers |-> 0 ]
     /\  vGVec = [
@@ -958,8 +974,8 @@ HandleViewChangeReq(m) ==
     /\  vDeadlineQuorum' = [
             vDeadlineQuorum EXCEPT ![myServerId] = {}
         ]
-    \* Clear vCrossShardConfirmQuorum
-    /\  vCrossShardConfirmQuorum' = [
+    \* Clear vCrossShardVerifyReps
+    /\  vCrossShardVerifyReps' = [
             serverId \in Servers |-> {}
         ]
     \* Send ViewChange to the myLeader
@@ -1057,24 +1073,84 @@ HandleViewChange(m) ==
     /\  IF Cardinality(vViewChange'[myServerId]) = QuorumSize THEN 
             /\  vLog' = [ vLog EXCEPT ![myServerId] = ReBuildLogs(vViewChange'[myServerId])]
             /\  vServerStatus' = [vServerStatus EXCEPT ![myServerId] = StCrossShardSyncing]
-            /\  vLastNormView' = [vLastNormView EXCEPT ![myServerId] = vLView[myServerId]]
             (* Even after the log is recovered within one shard,
                 * The newly elected leader cannot StartView
-                * It needs to sync with other shards' leaders to ensure strict serializability
+                * It needs to verify with other shards' leaders to ensure strict serializability
                 *)
             /\  vViewChange' = [vViewChange EXCEPT ![myServerId] = {}]
             /\  Send({[
-                    mtype      |-> MCrossShardConfirm,
+                    mtype      |-> MCrossShardVerifyReq,
                     sender     |-> myServerId,
                     dest       |-> dst,
                     lView      |-> vLView'[myServerId],
                     gView      |-> vGView'[myServerId],
-                    entries    |-> SelectEntriesBeyondCommitPoint(
-                                    vLog'[myServerId], vPeerCommitDeadline[dst.shardId])
+                    syncedDdl  |-> vLog[myServerId][vLSyncPoint[myServerId]].deadline
                 ] : dst \in leadersInAllShard} )
         ELSE 
             /\  vServerStatus' = [vServerStatus EXCEPT ![myServerId] = StViewChange ] 
-            /\  UNCHANGED << networkVars, vLog, vServerStatus, vViewChange>>
+            /\  UNCHANGED << networkVars, vLog>>
+
+HandleCrossShardVerifyReq(m) ==
+    LET 
+        myServerId == m.dest 
+        myLog == vLog[myServerId]
+        logSet == SeqToSet(myLog)
+        unVerifiedLogs == { 
+            e \in logSet:   /\  e.deadline > m.syncedDdl 
+                            /\  m.sender \in e.shards 
+        }
+        unVerifiedLogList == SetToSortSeq(unVerifiedLogs, Compare)
+    IN
+    /\  m.gView = vGView[myServerId]
+    /\  m.lView = vGVec[myServerId][m.sender.shardId]
+    /\  Send({[
+            mtype      |-> MCrossShardVerifyRep,
+            sender     |-> myServerId,
+            dest       |-> m.sender,
+            lView      |-> vLView[myServerId],
+            gView      |-> vGView[myServerId],
+            entries    |-> unVerifiedLogList
+        ]})
+
+HandleCrossShardVerifyRep(m) ==
+    LET
+        myServerId == m.dest 
+        myLog == vLog[myServerId]
+        myLogSet == SeqToSet(myLog)
+    IN 
+    /\  m.gView = vGView[myServerId]
+    /\  m.lView = vGVec[myServerId][m.sender.shardId] 
+    /\  vCrossShardVerifyReps' = [
+            vCrossShardVerifyReps EXCEPT ![myServerId]= 
+                vCrossShardVerifyReps[myServerId] \cup {m} ]
+    /\  IF Cardinality(vCrossShardVerifyReps'[myServerId]) = Cardinality(Shards) 
+        THEN
+            LET 
+                unVerifiedLogs == UNION { SeqToSet(mm.entries) : 
+                    mm \in vCrossShardVerifyReps'[myServerId] }
+                maxDeadlineLogs == {
+                    e \in unVerifiedLogs:
+                        \A x \in unVerifiedLogs: 
+                            \/ x.txnId # e.txnId 
+                            \/ x.deadline <= e.deadline
+                }
+                agreedLogs == { 
+                    e \in maxDeadlineLogs :
+                        \* the reciving shard is missing this txn
+                        \/  \A x \in myLogSet: x.txnId # e.txnId 
+                        \/  \E x \in myLogSet: x.deadline < e.deadline 
+                }
+                goodLogs == {
+                    e \in myLogSet : \A x \in agreedLogs: x.txnId # e.txnId
+                }
+                completeLogs == goodLogs \cup agreedLogs 
+                newLogList == SetToSortSeq(completeLogs, Compare)
+            IN 
+                vLog' = [vLog EXCEPT ![myServerId] = newLogList]
+        ELSE 
+            UNCHANGED << vLog >>                
+                
+
 
 
 BuildGlobalConsistentLog(serverId, entries) == 
@@ -1089,47 +1165,6 @@ BuildGlobalConsistentLog(serverId, entries) ==
     IN 
     SetToSortSeq(myEntries, Compare)
 
-HandleCrossShardConfirm(m) ==
-    LET 
-        myServerId == m.dest
-    IN
-    /\  vServerStatus[myServerId] = StCrossShardSyncing
-    /\  m.gView = vGView[myServerId]
-    /\  m.lView = vGVec[myServerId][m.sender.shardId]
-    /\  vCrossShardConfirmQuorum' = [
-            vCrossShardConfirmQuorum EXCEPT ![myServerId] = {
-                mm \in vCrossShardConfirmQuorum[myServerId]:
-                    /\  mm.gView = vGView[myServerId]
-                    /\  mm.lView = vGVec[myServerId][mm.sender.shardId]
-            } \cup {m}
-        ]
-    /\  IF  Cardinality(vCrossShardConfirmQuorum'[myServerId]) = Cardinality(Shards) 
-        THEN
-            \* Check Txns' Deadlines to ensure strict serializability is not violated
-            \* In implementation, we should not pass all txns, instead, we should only pass dealines and txn indices
-            \* As an optimization, we should also use checkpoint in implementation
-            \* Here for conciseness, we pass all log entries
-            LET 
-                allLogs == UNION { SeqToSet(mm.entries): 
-                                    mm \in vCrossShardConfirmQuorum'[myServerId] }
-                serversInOneShard ==  { s \in Servers: s.shardId = myServerId.shardId }
-            IN 
-            /\  vLog' = [
-                    vLog EXCEPT ![myServerId] = 
-                        BuildGlobalConsistentLog(m.sender, allLogs)
-                ]
-            /\  Send({[
-                    mtype      |-> MStartView,
-                    sender     |-> myServerId,
-                    dest       |-> dst,
-                    lView      |-> vLView[myServerId],
-                    gView      |-> vGView[myServerId],
-                    gVec       |-> vGVec[myServerId],
-                    entries    |-> vLog'[myServerId],
-                    cv         |-> vCrashVector[myServerId]
-                ]: dst \in serversInOneShard })            
-        ELSE 
-            UNCHANGED << vLog, networkVars >> 
 
 HandleStartView(m) ==
     LET 
@@ -1148,8 +1183,8 @@ HandleStartView(m) ==
     /\  vEarlyBuffer' = [ vEarlyBuffer EXCEPT ![myServerId] = {} ]
     /\  vLateBuffer' = [ vLateBuffer EXCEPT ![myServerId] = {} ]
     /\  vDeadlineQuorum' = [ vDeadlineQuorum EXCEPT ![myServerId] = {} ]
-    /\  vCrossShardConfirmQuorum' = [
-            vCrossShardConfirmQuorum EXCEPT ![myServerId] = {}
+    /\  vCrossShardVerifyReps' = [
+            vCrossShardVerifyReps EXCEPT ![myServerId] = {}
         ]
     /\  vLSyncPoint' = [vLSyncPoint EXCEPT ![myServerId] = Len(vLog'[myServerId])]
     /\  vLastNormView' = [vLastNormView EXCEPT ![myServerId] = m.lView]
@@ -1164,8 +1199,8 @@ ResetServerState(serverId) ==
     /\  vEarlyBuffer' = [ vEarlyBuffer EXCEPT ![serverId] = {}]
     /\  vLateBuffer' = [vLateBuffer EXCEPT ![serverId] = {}]
     /\  vDeadlineQuorum' = [vDeadlineQuorum EXCEPT ![serverId] = {}]
-    /\  vCrossShardConfirmQuorum' = [ 
-            vCrossShardConfirmQuorum EXCEPT ![serverId] = {} 
+    /\  vCrossShardVerifyReps' = [ 
+            vCrossShardVerifyReps EXCEPT ![serverId] = {} 
         ]
     /\  vGView' = [vGView EXCEPT ![serverId] = 0]
     /\  vGVec' = [ vGVec EXCEPT ![serverId] = [ s \in Shards |-> 0] ]
@@ -1192,7 +1227,6 @@ StartServerRecovery(serverId) ==
     IN 
     /\  vServerStatus' = [vServerStatus EXCEPT ![serverId] = StRecovering]
     /\  vUUIDCounter' = [ vUUIDCounter EXCEPT ![serverId] = vUUIDCounter[serverId]+1]
-    /\  ResetServerState(serverId)
     /\  Send({[
             mtype       |-> MCrashVectorReq,
             sender      |-> serverId, 
@@ -1391,43 +1425,6 @@ HandleLocalCommit(m) ==
 
 
 
-                            
-BroadcastCommitStatusToPeers(serverId) ==
-    LET 
-        serversInOneReplica == {s \in Servers: s.replicaId = serverId.replicaId} 
-        commitPoint == vLCommitPoint[serverId]
-        commitDeadline == 
-            IF commitPoint = 0 THEN 0
-            ELSE vLog[commitPoint].deadline
-    IN
-    /\  vServerStatus[serverId] = StNormal
-    /\  Send({[
-            mtype       |-> MPeerShardCommitStatus,
-            sender      |-> serverId,
-            dest        |-> dst ,
-            gView       |-> vGView[serverId],
-            lView       |-> vLView[serverId],
-            deadline    |-> commitDeadline
-        ]: dst \in serversInOneReplica })
-     
-
-
-HandlePeerShardCommitStatus(m) ==
-    LET 
-        myServerId == m.dest 
-    IN
-    /\  vServerStatus[myServerId] = StNormal
-    /\  vGView[myServerId] = m.gView 
-    /\  vGVec[myServerId][m.sender.shardId] = m.lView
-    /\  IF  m.deadline > vPeerCommitDeadline[myServerId][m.sender.shardId] THEN 
-            /\  vPeerCommitDeadline[myServerId]' = [
-                    vPeerCommitDeadline[myServerId] 
-                        EXCEPT ![m.sender.shardId] = m.deadline
-                ]
-        ELSE UNCHANGED  << vPeerCommitDeadline >>
-
-
-
 
 isCommitting(txn, deadlineQ) == 
     LET quorum == { msg \in deadlineQ: msg.entry.txnId =txn.txnId}
@@ -1509,7 +1506,7 @@ ServerClockMove(serverId) ==
             ELSE    
                 UNCHANGED <<networkVars, vLog, vEarlyBuffer, 
                     vLateBuffer, vDeadlineQuorum>>
-        /\  UNCHANGED << vCrossShardConfirmQuorum,
+        /\  UNCHANGED << vCrossShardVerifyReps,
                 vServerStatus, vGView, vGVec, vLView, vLastNormView,
                 vViewChange, vLSyncPoint, vLCommitPoint, 
                 vPeerCommitDeadline, vLSyncQuorum,
@@ -1551,7 +1548,7 @@ Next ==
             vServerProcessed[m.dest] \cup {m} ]
         /\ HandleTxn(m)
         /\ UNCHANGED  << coordStateVars, configManagerStateVars,
-            vLog,vDeadlineQuorum, vCrossShardConfirmQuorum, 
+            vLog,vDeadlineQuorum, vCrossShardVerifyReps, 
             vServerStatus, vGView, vGVec,
             vLView, vServerClock, vLastNormView, 
             vViewChange, vLSyncPoint, vLCommitPoint,  
@@ -1568,7 +1565,7 @@ Next ==
             vServerProcessed[m.dest] \cup {m} ]
         /\ HandleDeadlineNotification(m)
         /\ UNCHANGED  << networkVars, coordStateVars, configManagerStateVars, 
-                vLog, vCrossShardConfirmQuorum, vLateBuffer, 
+                vLog, vCrossShardVerifyReps, vLateBuffer, 
                 vServerStatus, vGView, vGVec,
                 vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, 
@@ -1585,7 +1582,7 @@ Next ==
             vServerProcessed[m.dest] \cup {m} ]
         /\ HandleInterReplicaSync(m)
         /\ UNCHANGED << coordStateVars, configManagerStateVars,
-                vLog,  vCrossShardConfirmQuorum, vLateBuffer, 
+                vLog,  vCrossShardVerifyReps, vLateBuffer, 
                 vServerStatus, vGView, vGVec,
                 vLView, vServerClock, vLastNormView, 
                 vViewChange, vLCommitPoint, vPeerCommitDeadline, 
@@ -1598,10 +1595,11 @@ Next ==
     \/ \E serverId \in Servers: 
         /\ vLView[serverId] < MaxViews
         /\ isLeader(serverId.replicaId, vLView[serverId])
+        /\ vServerStatus[serverId] = StNormal
         /\ StartLeaderFail(serverId)
         /\ UNCHANGED << networkVars, coordStateVars, configManagerStateVars, 
             vLog, vEarlyBuffer, vLateBuffer, 
-            vDeadlineQuorum, vCrossShardConfirmQuorum, vGView, vGVec, 
+            vDeadlineQuorum, vCrossShardVerifyReps, vGView, vGVec, 
             vLView, vServerClock, vLastNormView, 
             vViewChange, vLSyncPoint, vLCommitPoint, 
             vPeerCommitDeadline, vLSyncQuorum,
@@ -1620,6 +1618,7 @@ Next ==
         /\  m \notin vCMProcessed[m.dest]
         /\  vCMProcessed' = [vCMProcessed EXCEPT ![m.dest] = 
                 vCMProcessed[m.dest] \cup {m}]
+        /\  vCMStatus[m.dest] = StNormal 
         /\  HandleCMPrepare(m)
         /\  UNCHANGED  <<coordStateVars, serverStateVars >>
         /\ ActionName' = << "HandleCMPrepare" >>
@@ -1630,6 +1629,7 @@ Next ==
         /\  m \notin vCMProcessed[m.dest]
         /\  vCMProcessed' = [vCMProcessed EXCEPT ![m.dest] = 
                 vCMProcessed[m.dest] \cup {m}]
+        /\  vCMStatus[m.dest] = StNormal 
         /\  HandleCMPrepareReply(m)
         /\  UNCHANGED  <<coordStateVars, serverStateVars, 
                         vCMStatus, vCMView, vCMPrepareGInfo >>
@@ -1640,6 +1640,7 @@ Next ==
         /\  m \notin vCMProcessed[m.dest]
         /\  vCMProcessed' = [vCMProcessed EXCEPT ![m.dest] = 
                 vCMProcessed[m.dest] \cup {m}]
+        /\  vCMStatus[m.dest] = StNormal 
         /\  HandleCMCommit(m)
         /\  UNCHANGED  <<networkVars, coordStateVars, serverStateVars, 
                         vCMStatus, vCMView, vCMPrepareGInfo, vCMPrepareReps>>
@@ -1651,7 +1652,8 @@ Next ==
         /\  m \notin vServerProcessed[m.dest]
         /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
                 vServerProcessed[m.dest] \cup {m} ]
-        /\  vServerStatus[m.dest] # StFailing
+        /\  \/  vServerStatus[m.dest] = StNormal 
+            \/  vServerStatus[m.dest] = StViewChange 
         /\  HandleViewChangeReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vServerClock, vViewChange, vLSyncPoint, 
@@ -1666,7 +1668,8 @@ Next ==
         /\  m \notin vServerProcessed[m.dest]
         /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
                 vServerProcessed[m.dest] \cup {m} ]
-        /\  vServerStatus[m.dest] # StFailing
+        /\  \/  vServerStatus[m.dest] = StNormal 
+            \/  vServerStatus[m.dest] = StViewChange 
         /\  HandleViewChange(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vGVec, vServerClock, vLSyncPoint, vLastNormView,
@@ -1676,17 +1679,38 @@ Next ==
         /\ ActionName' = << "HandleViewChange" >>
 
     \/  \E m \in messages:
-        /\  m.mtype = MCrossShardConfirm
+        /\  m.mtype = MCrossShardVerifyReq
         /\  m \notin vServerProcessed[m.dest]
         /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
                 vServerProcessed[m.dest] \cup {m} ]
-        /\  vServerStatus[m.dest] = StViewChange
-        /\  HandleCrossShardConfirm(m)
+        /\  vServerStatus[m.dest] = StCrossShardSyncing
+        /\  HandleCrossShardVerifyReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vGVec, vServerClock, vLSyncPoint, vLastNormView,
-                vLCommitPoint, vPeerCommitDeadline, vLSyncQuorum,
-                vUUIDCounter, vCrashVector, vCrashVectorReps, vRecoveryReps >>
-        /\ ActionName' = << "HandleCrossShardConfirm" >>
+                vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
+                vCrossShardVerifyReps, vServerStatus, 
+                vGView, vGVec, vLView, vServerClock, vLastNormView, 
+                vViewChange, vLSyncPoint, vLCommitPoint, 
+                vPeerCommitDeadline, vLSyncQuorum,
+                vUUIDCounter, vCrashVector, vCrashVectorReps, 
+                vRecoveryReps>>
+        /\ ActionName' = << "HandleCrossShardVerifyReq" >>
+
+
+    \/  \E m \in messages:
+        /\  m.mtype = MCrossShardVerifyRep
+        /\  m \notin vServerProcessed[m.dest]
+        /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
+                vServerProcessed[m.dest] \cup {m} ]
+        /\  vServerStatus[m.dest] = StCrossShardSyncing
+        /\  HandleCrossShardVerifyRep(m)
+        /\  UNCHANGED  << coordStateVars, configManagerStateVars,
+                vEarlyBuffer, vLateBuffer, vDeadlineQuorum, vServerStatus, 
+                vGView, vGVec, vLView, vServerClock, vLastNormView, 
+                vViewChange, vLSyncPoint, vLCommitPoint, 
+                vPeerCommitDeadline, vLSyncQuorum,
+                vUUIDCounter, vCrashVector, vCrashVectorReps, 
+                vRecoveryReps>>
+        /\ ActionName' = << "HandleCrossShardVerifyRep" >>
 
     \/  \E m \in messages:
         /\  m.mtype = MStartView
@@ -1694,6 +1718,7 @@ Next ==
         /\  m \notin vServerProcessed[m.dest]
         /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
                 vServerProcessed[m.dest] \cup {m} ]
+        /\  vServerStatus[m.dest] # StFailing
         /\  HandleStartView(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                     vServerClock,vLCommitPoint, vPeerCommitDeadline, 
@@ -1706,7 +1731,7 @@ Next ==
         /\ vServerStatus' = [vServerStatus EXCEPT ![serverId] = StRecovering ]
         /\ ResetServerState(serverId)
         /\ StartServerRecovery(serverId)
-        /\ UNCHANGED << networkVars, coordStateVars, coordStateVars>>
+        /\ UNCHANGED << networkVars, coordStateVars, configManagerStateVars>>
         /\ ActionName' = << "StartReplicaRecovery">>
 
     \/  \E m \in messages:
@@ -1714,10 +1739,11 @@ Next ==
         /\  m \notin vServerProcessed[m.dest]
         /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
                 vServerProcessed[m.dest] \cup {m} ]
+        /\  vServerStatus[m.dest] = StNormal
         /\  HandleCrashVectorReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
-                vCrossShardConfirmQuorum, vServerStatus, 
+                vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec,vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, 
                 vPeerCommitDeadline, vLSyncQuorum, vUUIDCounter, 
@@ -1729,10 +1755,11 @@ Next ==
         /\  m \notin vServerProcessed[m.dest]
         /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
                 vServerProcessed[m.dest] \cup {m} ]
+        /\  vServerStatus[m.dest] = StRecovering
         /\  HandleCrashVectorRep(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vEarlyBuffer, vLateBuffer, 
-                vDeadlineQuorum, vCrossShardConfirmQuorum, vServerStatus, 
+                vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, 
                 vPeerCommitDeadline, vLSyncQuorum,
@@ -1744,11 +1771,12 @@ Next ==
         /\  m \notin vServerProcessed[m.dest]
         /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
                 vServerProcessed[m.dest] \cup {m} ]
+        /\  vServerStatus[m.dest] = StNormal
         /\  isCrashVectorValid(m)
         /\  HandleRecoveryReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vEarlyBuffer, vLateBuffer, 
-                vDeadlineQuorum, vCrossShardConfirmQuorum, vServerStatus, 
+                vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, 
                 vPeerCommitDeadline, vLSyncQuorum,
@@ -1760,11 +1788,12 @@ Next ==
         /\  m \notin vServerProcessed[m.dest]
         /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
                 vServerProcessed[m.dest] \cup {m} ]
+        /\  vServerStatus[m.dest] = StRecovering
         /\  isCrashVectorValid(m)
         /\  HandleRecoveryRep(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vEarlyBuffer, vLateBuffer, 
-                vDeadlineQuorum, vCrossShardConfirmQuorum, vServerStatus, 
+                vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
                 vGVec, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, 
                 vPeerCommitDeadline, vLSyncQuorum,
@@ -1776,11 +1805,12 @@ Next ==
         /\  m \notin vServerProcessed[m.dest]
         /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
                 vServerProcessed[m.dest] \cup {m} ]
+        /\  vServerStatus[m.dest] = StCrossShardSyncing
         /\  isCrashVectorValid(m)
         /\  HandleStartViewReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
-                vCrossShardConfirmQuorum, vServerStatus, 
+                vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, 
                 vLastNormView, vViewChange, vLSyncPoint, 
                 vLCommitPoint, vPeerCommitDeadline, vLSyncQuorum,
@@ -1790,6 +1820,7 @@ Next ==
 
     \* Periodic Sync
     \/  \E serverId \in Servers:
+        /\  vServerStatus[serverId] = StNormal
         /\  StartLocalSync(serverId) 
         /\  UNCHANGED  << coordStateVars, 
                 serverStateVars, configManagerStateVars>>
@@ -1800,11 +1831,12 @@ Next ==
         /\  m \notin vServerProcessed[m.dest]
         /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
                 vServerProcessed[m.dest] \cup {m} ]
+        /\  vServerStatus[m.dest] = StNormal
         /\  isCrashVectorValid(m)
         /\  HandleLocalSyncStatus(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vEarlyBuffer, vLateBuffer, 
-                vDeadlineQuorum, vCrossShardConfirmQuorum, 
+                vDeadlineQuorum, vCrossShardVerifyReps, 
                 vServerClock, vViewChange, vGVec, vGView, 
                 vLSyncPoint, vLView, vLastNormView,
                 vServerStatus, vPeerCommitDeadline,
@@ -1817,11 +1849,12 @@ Next ==
         /\  m \notin vServerProcessed[m.dest]
         /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
                 vServerProcessed[m.dest] \cup {m} ]
+        /\  vServerStatus[m.dest] = StNormal
         /\  isCrashVectorValid(m)
         /\  HandleLocalCommit(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 networkVars, vLog, vEarlyBuffer, vLateBuffer, 
-                vDeadlineQuorum, vCrossShardConfirmQuorum, 
+                vDeadlineQuorum, vCrossShardVerifyReps, 
                 vServerStatus, vServerClock, 
                 vGView, vGVec, vLView, vLastNormView, 
                 vViewChange, vLSyncPoint, vPeerCommitDeadline, 
@@ -1829,27 +1862,6 @@ Next ==
                 vCrashVectorReps, vRecoveryReps >>
         /\ ActionName' = << "HandleLocalCommit" >>
 
-
-    \/  \E serverId \in Servers:
-        /\  BroadcastCommitStatusToPeers(serverId) 
-        /\  UNCHANGED  << coordStateVars, serverStateVars, 
-                configManagerStateVars>>
-        /\  ActionName' = << "BroadcastCommitStatusToPeers" >>
-
-    \/  \E m \in messages:
-        /\  m.mtype = MPeerShardCommitStatus
-        /\  m \notin vServerProcessed[m.dest]
-        /\  vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
-                vServerProcessed[m.dest] \cup {m} ]
-        /\  HandlePeerShardCommitStatus(m)
-        /\  UNCHANGED  << networkVars, coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, vServerStatus,
-                vDeadlineQuorum, vCrossShardConfirmQuorum,  
-                vGView, vGVec,vLView, vServerClock, vLastNormView, 
-                vViewChange, vLSyncPoint, vLCommitPoint,
-                vPeerCommitDeadline, vLSyncQuorum, vUUIDCounter, 
-                vCrashVector, vCrashVectorReps, vRecoveryReps >>
-        /\  ActionName' = << "HandlePeerShardCommitStatus" >>
 
     \* Clock Move
     \/ \E serverId \in Servers: 
