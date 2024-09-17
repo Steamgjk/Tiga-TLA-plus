@@ -70,7 +70,7 @@ StFailing == 5
 (* `^\textbf{\large Message Types}^' *)
 MTxn == 1
 MLogEntry == 2  \* Log entry, different from index, it includes command field, which can be large in practice
-MDeadlineNotification == 3 \* Leaders send the message to other leaders for deadline agreement
+MTimestampNotification == 3 \* Leaders send the message to other leaders for timestamp agreement
 MInterReplicaSync == 4   \* Synchronize within shard group (across replicas) to ensure strict serializability 
 MFastReply == 5 \* Fast Reply Message
 MSlowReply == 6 \* Slow Reply Message
@@ -111,9 +111,9 @@ MCMCommit == 22
 
     Each server is identified by a combination of <replicaId, shardId>
     TxnID uniquely identifies one request on one server
-    But across replicas, the same TxnID may have different deadlines
-    (the leader may modify the deadline to make the request eligible to enter the early-buffer)
-    so <deadline, txnId> uniquely identifes one request across replicas 
+    But across replicas, the same TxnID may have different timestamps
+    (the leader may modify the timestamp to make the request eligible to enter the early-buffer)
+    so <timestamp, txnId> uniquely identifes one request across replicas 
 
     TxnID = [
         coordId |-> i in (1..),
@@ -134,13 +134,13 @@ MCMCommit == 22
         txnId   |-> TxnID,
         shards  |-> Shards,
         command |-> command,
-        deadline|-> deadline
+        timestamp|-> timestamp
     ]
 
-    After the request arrives at the shards and is placed into its early buffer (either with deadline modified or not), the server will broadcast DeadlineNotification to all the other servers in the same replica group to tell them the deadline of the request on its own server
+    After the request arrives at the shards and is placed into its early buffer (either with timestamp modified or not), the server will broadcast TimestampNotification to all the other servers in the same replica group to tell them the timestamp of the request on its own server
 
-    DeadlineNotification = [ 
-        mtype   |-> MDeadlineNotification,
+    TimestampNotification = [ 
+        mtype   |-> MTimestampNotification,
         gView   |-> 0...x
         lView   |-> 0...y 
         sender  |-> src \in Servers,
@@ -172,7 +172,7 @@ MCMCommit == 22
 
         hash        |-> [ entries |-> log entries so far
                          cv |-> crashVector ] 
-        deadline    |-> i \in (1..MaxTime+MaxBound),
+        timestamp    |-> i \in (1..MaxTime+MaxBound),
         logId       |-> n \in (1..)
     ]
 
@@ -216,10 +216,10 @@ MCMCommit == 22
         dest       |-> dst \in Servers,
         lView      |-> 0..x
         gView      |-> 0..x
-        syncedDdl  |-> The largest deadline of the synced entries
+        syncedDdl  |-> The largest timestamp of the synced entries
     ]
 
-    Reply the entries to the other leaders. These entries' log positions are beyond the syncPoint of the receiving leader, so that the receiving leader can verify whether it needs deadline agreement for the txn, or even misses the txn 
+    Reply the entries to the other leaders. These entries' log positions are beyond the syncPoint of the receiving leader, so that the receiving leader can verify whether it needs timestamp agreement for the txn, or even misses the txn 
 
     MCrossShardVerifyRep = [ 
         mtype      |-> MCrossShardVerifyRep,
@@ -314,7 +314,7 @@ MCMCommit == 22
         sender      |-> src \in Servers,
         dest        |-> dst \in Servers,
         gView       |-> 0..x
-        deadline    |-> the largest committed deadline
+        timestamp    |-> the largest committed timestamp
     ]
 
 
@@ -365,15 +365,15 @@ VARIABLES
             (* Log list of entries 
             *)
             vLog,            
-            (* The sequencer to hold txns and release it after clock passes its deadline (s+l) 
+            (* The sequencer to hold txns and release it after clock passes its timestamp (s+l) 
             *)
             vEarlyBuffer, 
             (* The buffer to hold txns on followers because these txns come too late and cannot enter early-buffer 
             *)
             vLateBuffer,     
-            (* Each leader server has a data structure of DeadlineQuroum to collect the deadlines from other servers for agreement 
+            (* Each leader server has a data structure of TimestampQuroum to collect the timestamps from other servers for agreement 
             *)
-            vDeadlineQuorum,
+            vTimestampQuorum,
 
             (* One of StNormal, StViewChange, StFailing, StCrossShardSyncing, StRecovering  
             *)
@@ -396,7 +396,7 @@ VARIABLES
             (* Used for collecting view change votes 
             *)
             vViewChange,  
-            (* Used for collecting CrossShardVerify replies. After the leader have recovered their logs for its own shard, they need verify from the other shards to ensure the recovered logs satisfy strict serializability, i.e., every log has commonly-agreed deadlines across sharding groups. 
+            (* Used for collecting CrossShardVerify replies. After the leader have recovered their logs for its own shard, they need verify from the other shards to ensure the recovered logs satisfy strict serializability, i.e., every log has commonly-agreed timestamps across sharding groups. 
             *)
             vCrossShardVerifyReps,
             (* vLSyncPoint indicates to which the server state (vLog) is consistent with the leader.  
@@ -455,7 +455,7 @@ networkVars == << messages >>
 
 serverStateVars == 
     << vLog, vEarlyBuffer, vLateBuffer, 
-    vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
+    vTimestampQuorum, vCrossShardVerifyReps, vServerStatus, 
     vGView, vGVec, vLView, vServerClock, vLastNormView, 
     vViewChange, vLSyncPoint, vLCommitPoint, 
     vLSyncQuorum,vUUIDCounter, vCrashVector, 
@@ -475,7 +475,7 @@ InitServerState ==
     /\  vLog = [ serverId \in Servers |-> << >> ]
     /\  vEarlyBuffer   = [ serverId \in Servers |-> {} ]
     /\  vLateBuffer   = [ serverId \in Servers |-> {} ]
-    /\  vDeadlineQuorum  =   [ serverId \in Servers |-> {} ]
+    /\  vTimestampQuorum  =   [ serverId \in Servers |-> {} ]
     /\  vCrossShardVerifyReps = [ serverId \in Servers |-> {} ]
     /\  vServerStatus    =   [ serverId \in Servers |-> StNormal ]
     /\  vGView  =   [ serverId \in Servers |-> 0 ]
@@ -623,8 +623,8 @@ ASSUME
 (* Coordinator c submits a txn. We assume Coordinator can only send one txn in one tick of time. If time has reached the bound, this client cannot send request any more
 *)
 
-LastAppendedDeadline(Log) == IF Len(Log)=0 THEN 0
-                               ELSE Tail(Log).deadline
+LastAppendedTimestamp(Log) == IF Len(Log)=0 THEN 0
+                               ELSE Tail(Log).timestamp
 
 CoordSubmitTxn(c)   ==  
     /\ vCoordClock[c] < MaxTime 
@@ -657,7 +657,7 @@ HandleTxn(m) ==
             txnId   |-> m.txnId,
             command |-> m.command,
             shards  |-> m.shards,
-            deadline|-> Max(LastAppendedDeadline(vLog[myServerId]), m.st + m.bound)
+            timestamp|-> Max(LastAppendedTimestamp(vLog[myServerId]), m.st + m.bound)
         ]
         serversInOneReplica == {s \in Servers: s.replicaId = myServerId.replicaId} 
     IN
@@ -665,9 +665,9 @@ HandleTxn(m) ==
         /\ vEarlyBuffer' = [
             vEarlyBuffer EXCEPT ![myServerId]
                 = vEarlyBuffer[myServerId] \cup {newLog}]
-        \* Broadcast deadline notifications to other shards
+        \* Broadcast timestamp notifications to other shards
         /\ Send({[
-            mtype   |-> MDeadlineNotification,
+            mtype   |-> MTimestampNotification,
             gView   |-> vGView[myServerId],
             lView   |-> vLView[myServerId],
             sender  |-> myServerId,
@@ -676,13 +676,13 @@ HandleTxn(m) ==
             ]: dstServerId \in serversInOneReplica })
         /\  UNCHANGED  << vLateBuffer >>
     \/  /\  ~isLeader(myServerId.replicaId, vLView[myServerId])
-        /\  \/  /\ newLog.deadline = (m.st + m.bound)
+        /\  \/  /\ newLog.timestamp = (m.st + m.bound)
                 /\ vEarlyBuffer' = [
                         vEarlyBuffer EXCEPT ![myServerId]
                             = vEarlyBuffer[myServerId] \cup {newLog}
                     ]
                 /\  UNCHANGED << vLateBuffer >>
-            \/  /\ ~(newLog.deadline = (m.st + m.bound))
+            \/  /\ ~(newLog.timestamp = (m.st + m.bound))
                 /\   vLateBuffer' = [
                         vLateBuffer EXCEPT ![myServerId]
                             = vLateBuffer[myServerId] \cup {newLog}
@@ -692,44 +692,44 @@ HandleTxn(m) ==
 
 
 
-HandleDeadlineNotification(m) ==    
+HandleTimestampNotification(m) ==    
     LET   
         myServerId == m.dest
         quorum == {
-            msg \in vDeadlineQuorum[myServerId] 
+            msg \in vTimestampQuorum[myServerId] 
                 :   /\ msg.entry.txnId = m.entry.txnId
                     /\ msg.gView = m.gView
                     /\ m.gView = vGView[myServerId]
             } \cup { m }
     IN
-    \* Only leader does deadline agreement
+    \* Only leader does timestamp agreement
     /\  vGView[myServerId] = m.gView
     /\  vGVec[myServerId][m.sender.shardId] = m.lView
     /\  isLeader(myServerId.replicaId, vLView[myServerId])
-    /\  vDeadlineQuorum' = [
-            vDeadlineQuorum EXCEPT ![myServerId] 
-                = vDeadlineQuorum[myServerId] \cup {m}
+    /\  vTimestampQuorum' = [
+            vTimestampQuorum EXCEPT ![myServerId] 
+                = vTimestampQuorum[myServerId] \cup {m}
         ]
     /\  IF  Cardinality(quorum) = Cardinality(m.entry.shards)   
         THEN
-        (* Deadline quorum established : Update the deadline of the txn in Sequencer *)
+        (* Timestamp quorum established : Update the timestamp of the txn in Sequencer *)
             LET 
-                maxDeadlineTxn == 
+                maxTimestampTxn == 
                     CHOOSE x \in quorum : 
                         \A y \in quorum: 
-                            y.entry.deadline <= x.entry.deadline 
+                            y.entry.timestamp <= x.entry.timestamp 
                 sequencingTxn == 
                     CHOOSE x \in vEarlyBuffer[myServerId]: 
                         x.txnId = m.entry.txnId  
             IN
-            IF maxDeadlineTxn.entry.deadline > sequencingTxn.deadline 
+            IF maxTimestampTxn.entry.timestamp > sequencingTxn.timestamp 
             THEN 
                 vEarlyBuffer' = [ vEarlyBuffer EXCEPT ![myServerId] 
-                    = (vEarlyBuffer[myServerId] \ {sequencingTxn}) \cup {maxDeadlineTxn.entry} ]
+                    = (vEarlyBuffer[myServerId] \ {sequencingTxn}) \cup {maxTimestampTxn.entry} ]
             ELSE UNCHANGED  << vEarlyBuffer >>
         
         ELSE    
-        (* Deadline quorum not sufficient so far: do not take further actions *)
+        (* Timestamp quorum not sufficient so far: do not take further actions *)
             UNCHANGED  << vEarlyBuffer >>
         
             
@@ -761,11 +761,11 @@ HandleInterReplicaSync(m) ==
                         =  { msg \in vLateBuffer[myServerId]: 
                             msg.txnId \notin syncedTxnIds }
                 ]
-            (* Kick synced entries out of deadline quorum. These txns have been synced, no need to record in DeadlineQuorum
+            (* Kick synced entries out of timestamp quorum. These txns have been synced, no need to record in TimestampQuorum
             *)
-            /\  vDeadlineQuorum' = [ 
-                    vDeadlineQuorum EXCEPT ![myServerId]
-                        = { msg \in vDeadlineQuorum[myServerId]: 
+            /\  vTimestampQuorum' = [ 
+                    vTimestampQuorum EXCEPT ![myServerId]
+                        = { msg \in vTimestampQuorum[myServerId]: 
                             msg.txnId \notin syncedTxnIds}
                 ]
             /\  vLSyncPoint' = [
@@ -784,7 +784,7 @@ HandleInterReplicaSync(m) ==
         \/  /\  currentSyncPoint >= Len(m.entries)
             \* Noting new to sync
             /\  UNCHANGED << networkVars, vLog, vEarlyBuffer, 
-                            vLateBuffer, vDeadlineQuorum, vLSyncPoint>>
+                            vLateBuffer, vTimestampQuorum, vLSyncPoint>>
 
 
 
@@ -955,9 +955,9 @@ HandleViewChangeReq(m) ==
     /\  vLateBuffer' = [
             vLateBuffer EXCEPT ![myServerId] = {}
         ]
-    \* Clear deadline quorum
-    /\  vDeadlineQuorum' = [
-            vDeadlineQuorum EXCEPT ![myServerId] = {}
+    \* Clear timestamp quorum
+    /\  vTimestampQuorum' = [
+            vTimestampQuorum EXCEPT ![myServerId] = {}
         ]
     \* Clear vCrossShardVerifyReps
     /\  vCrossShardVerifyReps' = [
@@ -980,10 +980,10 @@ HandleViewChangeReq(m) ==
 (* Define a comparison function based on the key 
 *)
 Compare(a, b) ==    
-    \/ a.deadline < b.deadline
-    \/  /\ a.deadline = b.deadline 
+    \/ a.timestamp < b.timestamp
+    \/  /\ a.timestamp = b.timestamp 
         /\ a.txnId.coordId < b.txnId.coordId
-    \/  /\ a.deadline = b.deadline 
+    \/  /\ a.timestamp = b.timestamp 
         /\ a.txnId.coordId = b.txnId.coordId
         /\ a.txnId.rId < b.txnId.rId
 
@@ -999,7 +999,7 @@ isCrashVectorValid(m) ==
 CountVotes(entry, logSets) == 
     LET
         validCandidates == { s \in logSets: \E e \in s: 
-                                /\ e.deadline = entry.deadline 
+                                /\ e.timestamp = entry.timestamp 
                                 /\ e.txnId = entry.txnId } 
     IN 
         Cardinality(validCandidates)
@@ -1013,21 +1013,21 @@ ReBuildLogs(vcQuorum) ==
         largestLSyncPointVC == CHOOSE vc \in refinedQuorum:
                                 \A sp \in lSyncPoints: sp <= vc.lSyncPoint 
         syncedLogSeq == SubSeq(largestLSyncPointVC.entries, 1, largestLSyncPointVC.lSyncPoint)
-        deadlineBoundary == IF largestLSyncPointVC.lSyncPoint =0 THEN 0
-                            ELSE syncedLogSeq[largestLSyncPointVC.lSyncPoint].deadline 
+        timestampBoundary == IF largestLSyncPointVC.lSyncPoint =0 THEN 0
+                            ELSE syncedLogSeq[largestLSyncPointVC.lSyncPoint].timestamp 
         logSets == { SeqToSet(m.entries): m \in refinedQuorum} 
         allLogs == UNION logSets
-        allUnSyncedLogs == { entry \in allLogs: entry.deadline > deadlineBoundary}
+        allUnSyncedLogs == { entry \in allLogs: entry.timestamp > timestampBoundary}
         unSyncedLogs == { entry \in allUnSyncedLogs: 
             CountVotes(entry, logSets)>=RecoveryQuorumSize} 
         unSyncedLogSeq == SetToSortSeq(unSyncedLogs, Compare)
     IN
     syncedLogSeq \o unSyncedLogSeq
 
-SelectEntriesBeyondCommitPoint(entries, deadline) ==
+SelectEntriesBeyondCommitPoint(entries, timestamp) ==
     LET 
         validLogIndices == {
-            i \in 1..Len(entries): entries[i].deadline> deadline
+            i \in 1..Len(entries): entries[i].timestamp> timestamp
         }
         startIndex == PickMin(validLogIndices)
     IN
@@ -1069,7 +1069,7 @@ HandleViewChange(m) ==
                     dest       |-> dst,
                     lView      |-> vLView'[myServerId],
                     gView      |-> vGView'[myServerId],
-                    syncedDdl  |-> vLog[myServerId][vLSyncPoint[myServerId]].deadline
+                    syncedDdl  |-> vLog[myServerId][vLSyncPoint[myServerId]].timestamp
                 ] : dst \in leadersInAllShard} )
         ELSE 
             /\  vServerStatus' = [vServerStatus EXCEPT ![myServerId] = StViewChange ] 
@@ -1081,7 +1081,7 @@ HandleCrossShardVerifyReq(m) ==
         myLog == vLog[myServerId]
         logSet == SeqToSet(myLog)
         unVerifiedLogs == { 
-            e \in logSet:   /\  e.deadline > m.syncedDdl 
+            e \in logSet:   /\  e.timestamp > m.syncedDdl 
                             /\  m.sender \in e.shards 
         }
         unVerifiedLogList == SetToSortSeq(unVerifiedLogs, Compare)
@@ -1113,17 +1113,17 @@ HandleCrossShardVerifyRep(m) ==
             LET 
                 unVerifiedLogs == UNION { SeqToSet(mm.entries) : 
                     mm \in vCrossShardVerifyReps'[myServerId] }
-                maxDeadlineLogs == {
+                maxTimestampLogs == {
                     e \in unVerifiedLogs:
                         \A x \in unVerifiedLogs: 
                             \/ x.txnId # e.txnId 
-                            \/ x.deadline <= e.deadline
+                            \/ x.timestamp <= e.timestamp
                 }
                 agreedLogs == { 
-                    e \in maxDeadlineLogs :
+                    e \in maxTimestampLogs :
                         \* the reciving shard is missing this txn
                         \/  \A x \in myLogSet: x.txnId # e.txnId 
-                        \/  \E x \in myLogSet: x.deadline < e.deadline 
+                        \/  \E x \in myLogSet: x.timestamp < e.timestamp 
                 }
                 goodLogs == {
                     e \in myLogSet : \A x \in agreedLogs: x.txnId # e.txnId
@@ -1144,7 +1144,7 @@ BuildGlobalConsistentLog(serverId, entries) ==
             entry \in entries : /\ serverId \in entry.shards 
                                 /\ \A e \in entries:
                                     IF e.txnId = entry.txnId THEN 
-                                        e.deadline <= entry.deadline 
+                                        e.timestamp <= entry.timestamp 
                                     ELSE TRUE
         }
     IN 
@@ -1167,7 +1167,7 @@ HandleStartView(m) ==
     /\  vLog' = [vLog EXCEPT ![myServerId] = m.entries]
     /\  vEarlyBuffer' = [ vEarlyBuffer EXCEPT ![myServerId] = {} ]
     /\  vLateBuffer' = [ vLateBuffer EXCEPT ![myServerId] = {} ]
-    /\  vDeadlineQuorum' = [ vDeadlineQuorum EXCEPT ![myServerId] = {} ]
+    /\  vTimestampQuorum' = [ vTimestampQuorum EXCEPT ![myServerId] = {} ]
     /\  vCrossShardVerifyReps' = [
             vCrossShardVerifyReps EXCEPT ![myServerId] = {}
         ]
@@ -1183,7 +1183,7 @@ ResetServerState(serverId) ==
     /\  vLog' = [vLog EXCEPT ![serverId] = <<>>]
     /\  vEarlyBuffer' = [ vEarlyBuffer EXCEPT ![serverId] = {}]
     /\  vLateBuffer' = [vLateBuffer EXCEPT ![serverId] = {}]
-    /\  vDeadlineQuorum' = [vDeadlineQuorum EXCEPT ![serverId] = {}]
+    /\  vTimestampQuorum' = [vTimestampQuorum EXCEPT ![serverId] = {}]
     /\  vCrossShardVerifyReps' = [ 
             vCrossShardVerifyReps EXCEPT ![serverId] = {} 
         ]
@@ -1410,29 +1410,55 @@ HandleLocalCommit(m) ==
 
 
 
-isCommitting(txn, deadlineQ) == 
-    LET quorum == { msg \in deadlineQ: msg.entry.txnId =txn.txnId}
+isCommitting(txn, timestampQ) == 
+    LET quorum == { msg \in timestampQ: msg.entry.txnId =txn.txnId}
     IN  Cardinality(quorum) = Cardinality(txn.shards)
                                 
 
-ReleaseSeqeuncer(serverId, currentTime) == 
+ReleaseSequencer(serverId, currentTime) == 
     LET
         serversInOneShard == { s \in Servers: s.shardId = serverId.shardId }
         expireTxns == 
             { msg \in vEarlyBuffer[serverId]:
-                /\ msg.deadline <= currentTime }
+                /\ msg.timestamp <= currentTime }
         sortedTxnList == SetToSortSeq(expireTxns, Compare)
         committingStatus == 
             [ i \in 1..Len(sortedTxnList) 
-                |-> isCommitting(sortedTxnList[i], vDeadlineQuorum[serverId])
+                |-> isCommitting(sortedTxnList[i], vTimestampQuorum[serverId])
             ]
         canReleaseTxnIndices == {
             i \in 1..Len(sortedTxnList):
                 \A j \in 1..i: committingStatus[j] = TRUE } 
+        \* Here we consider all txns are not commutative, 
+        \* Therefore,  At most one txn can be speculatively executed with risk 
+        \* Refer to RRSE in Section 3.6 
+        specTxnIndex == {
+            i \in 1..Len(sortedTxnList):
+                /\  \A j \in 1..(i-1): committingStatus[j] = TRUE 
+                /\  committingStatus[i] = FALSE 
+        }  
+               
     IN
     IF  Cardinality(canReleaseTxnIndices) =0  \* Nothing to release
-    THEN    UNCHANGED  << networkVars, 
-                vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum >>     
+    THEN    
+        /\  UNCHANGED  <<vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum >>     
+        /\  IF Cardinality(specTxnIndex) > 0 THEN 
+                Send({[
+                    mtype   |-> MFastReply,
+                    sender  |-> serverId,
+                    dest    |-> sortedTxnList[i].txnId.coordId,
+                    gView   |-> vGView[serverId],
+                    lView   |-> vLView[serverId],
+                    txnId   |-> sortedTxnList[i].txnId,
+                    hash    |-> [
+                                log |-> vLog'[serverId],
+                                cv  |-> vCrashVector
+                                ],
+                    t       |-> sortedTxnList[i].timestamp,
+                    logId   |-> 0 \* logId=0 indicates this is not a speculative txn with rollback risk
+                ]: i \in specTxnIndex })        
+            ELSE
+                UNCHANGED <<networkVars>>
     ELSE 
         LET  
             releaseUpTo == CHOOSE i \in canReleaseTxnIndices: 
@@ -1443,9 +1469,9 @@ ReleaseSeqeuncer(serverId, currentTime) ==
         /\ vEarlyBuffer' =[
             vEarlyBuffer EXCEPT ![serverId] 
                 = vEarlyBuffer[serverId] \ releaseTxns ]
-        /\ vDeadlineQuorum' = [
-            vDeadlineQuorum EXCEPT ![serverId]
-                = { msg \in vDeadlineQuorum[serverId]: 
+        /\ vTimestampQuorum' = [
+            vTimestampQuorum EXCEPT ![serverId]
+                = { msg \in vTimestampQuorum[serverId]: 
                     \A txn \in releaseTxns: txn.txnId # msg.entry.txnId}
             ]
         \* Append to log
@@ -1465,6 +1491,7 @@ ReleaseSeqeuncer(serverId, currentTime) ==
                         log |-> vLog'[serverId],
                         cv  |-> vCrashVector
                     ],
+            t       |->0, \* timestamp=0 indicates this is not a speculative txn with rollback risk
             logId   |-> i
             ]: i \in (1+Len(vLog[serverId]))..Len(vLog'[serverId]) })
         \* Send InterReplicaSync to the other servers in the same sharding group
@@ -1477,6 +1504,23 @@ ReleaseSeqeuncer(serverId, currentTime) ==
                 dest    |-> dstServerId,
                 entries |-> vLog'[serverId]
             ]: dstServerId \in serversInOneShard })
+        /\  IF Cardinality(specTxnIndex) > 0 THEN 
+                Send({[
+                    mtype   |-> MFastReply,
+                    sender  |-> serverId,
+                    dest    |-> sortedTxnList[i].txnId.coordId,
+                    gView   |-> vGView[serverId],
+                    lView   |-> vLView[serverId],
+                    txnId   |-> sortedTxnList[i].txnId,
+                    hash    |-> [
+                                log |-> vLog'[serverId],
+                                cv  |-> vCrashVector
+                                ],
+                    t       |-> sortedTxnList[i].timestamp,
+                    logId   |-> 0 \* logId=0 indicates this is not a speculative txn with rollback risk
+                ]: i \in specTxnIndex })        
+            ELSE
+                TRUE
 
 
 
@@ -1487,10 +1531,10 @@ ServerClockMove(serverId) ==
         /\  vServerClock' = [ 
                 vServerClock EXCEPT ![serverId] = vServerClock[serverId] +1]
         /\  IF  vServerStatus[serverId] = StNormal THEN
-                /\  ReleaseSeqeuncer(serverId, vServerClock[serverId] +1)
+                /\  ReleaseSequencer(serverId, vServerClock[serverId] +1)
             ELSE    
                 UNCHANGED <<networkVars, vLog, vEarlyBuffer, 
-                    vLateBuffer, vDeadlineQuorum>>
+                    vLateBuffer, vTimestampQuorum>>
         /\  UNCHANGED << vCrossShardVerifyReps,
                 vServerStatus, vGView, vGVec, vLView, vLastNormView,
                 vViewChange, vLSyncPoint, vLCommitPoint, 
@@ -1532,7 +1576,7 @@ Next ==
             vServerProcessed[m.dest] \cup {m} ]
         /\ HandleTxn(m)
         /\ UNCHANGED  << coordStateVars, configManagerStateVars,
-            vLog,vDeadlineQuorum, vCrossShardVerifyReps, 
+            vLog,vTimestampQuorum, vCrossShardVerifyReps, 
             vServerStatus, vGView, vGVec,
             vLView, vServerClock, vLastNormView, 
             vViewChange, vLSyncPoint, vLCommitPoint,  
@@ -1541,18 +1585,18 @@ Next ==
         /\ ActionName' = <<"HandleTxn">>
 
     \/ \E m \in messages:
-        /\ m.mtype = MDeadlineNotification
+        /\ m.mtype = MTimestampNotification
         /\ vServerStatus[m.dest] = StNormal
         /\ m \notin vServerProcessed[m.dest]
         /\ vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
             vServerProcessed[m.dest] \cup {m} ]
-        /\ HandleDeadlineNotification(m)
+        /\ HandleTimestampNotification(m)
         /\ UNCHANGED  << networkVars, coordStateVars, configManagerStateVars, 
                 vLog, vCrossShardVerifyReps, vLateBuffer, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, vLSyncQuorum, 
                 vUUIDCounter, vCrashVector, vCrashVectorReps, vRecoveryReps>>
-        /\ ActionName' = <<"HandleDeadlineNotification">>
+        /\ ActionName' = <<"HandleTimestampNotification">>
 
     \/ \E m \in messages:
         /\ m.mtype = MInterReplicaSync
@@ -1578,7 +1622,7 @@ Next ==
         /\ vServerStatus[serverId] = StNormal
         /\ StartLeaderFail(serverId)
         /\ UNCHANGED << networkVars, coordStateVars, configManagerStateVars, 
-            vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
+            vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum, 
             vCrossShardVerifyReps, vGView, vGVec, vLView, vServerClock, 
             vLastNormView, vViewChange, vLSyncPoint, vLCommitPoint, 
             vLSyncQuorum, vUUIDCounter, vCrashVector, vCrashVectorReps, 
@@ -1663,7 +1707,7 @@ Next ==
         /\  vServerStatus[m.dest] = StCrossShardSyncing
         /\  HandleCrossShardVerifyReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
+                vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum, 
                 vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, vLSyncQuorum,
@@ -1680,7 +1724,7 @@ Next ==
         /\  vServerStatus[m.dest] = StCrossShardSyncing
         /\  HandleCrossShardVerifyRep(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vEarlyBuffer, vLateBuffer, vDeadlineQuorum, vServerStatus, 
+                vEarlyBuffer, vLateBuffer, vTimestampQuorum, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, 
                 vLSyncQuorum, vUUIDCounter, vCrashVector, 
@@ -1717,7 +1761,7 @@ Next ==
         /\  vServerStatus[m.dest] = StNormal
         /\  HandleCrashVectorReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
+                vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum, 
                 vCrossShardVerifyReps, vServerStatus, vGView, vGVec,
                 vLView, vServerClock, vLastNormView, vViewChange, 
                 vLSyncPoint, vLCommitPoint, vLSyncQuorum, vUUIDCounter, 
@@ -1733,7 +1777,7 @@ Next ==
         /\  HandleCrashVectorRep(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vEarlyBuffer, vLateBuffer, 
-                vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
+                vTimestampQuorum, vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint,vLSyncQuorum,
                 vUUIDCounter, vCrashVectorReps, vRecoveryReps >>
@@ -1749,7 +1793,7 @@ Next ==
         /\  HandleRecoveryReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vEarlyBuffer, vLateBuffer, 
-                vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
+                vTimestampQuorum, vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, vLSyncQuorum,
                 vUUIDCounter, vCrashVectorReps, vRecoveryReps >>
@@ -1765,7 +1809,7 @@ Next ==
         /\  HandleRecoveryRep(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 vLog, vEarlyBuffer, vLateBuffer, 
-                vDeadlineQuorum, vCrossShardVerifyReps, vServerStatus, 
+                vTimestampQuorum, vCrossShardVerifyReps, vServerStatus, 
                 vGVec, vServerClock, vLastNormView, vViewChange, 
                 vLSyncPoint, vLCommitPoint, vLSyncQuorum,
                 vUUIDCounter, vCrashVectorReps, vRecoveryReps >>
@@ -1780,7 +1824,7 @@ Next ==
         /\  isCrashVectorValid(m)
         /\  HandleStartViewReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
+                vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum, 
                 vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, 
                 vLastNormView, vViewChange, vLSyncPoint, 
@@ -1806,7 +1850,7 @@ Next ==
         /\  isCrashVectorValid(m)
         /\  HandleLocalSyncStatus(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, vDeadlineQuorum, 
+                vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum, 
                 vCrossShardVerifyReps, vServerClock, vViewChange, 
                 vGVec, vGView, vLSyncPoint, vLView, vLastNormView,
                 vServerStatus,vUUIDCounter, vCrashVectorReps, 
@@ -1824,7 +1868,7 @@ Next ==
         /\  HandleLocalCommit(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
                 networkVars, vLog, vEarlyBuffer, vLateBuffer, 
-                vDeadlineQuorum, vCrossShardVerifyReps, 
+                vTimestampQuorum, vCrossShardVerifyReps, 
                 vServerStatus, vServerClock, vGView, vGVec, 
                 vLView, vLastNormView, vViewChange, vLSyncPoint, 
                 vLSyncQuorum, vUUIDCounter, vCrashVectorReps, vRecoveryReps >>
@@ -2049,10 +2093,16 @@ Serializability ==
                                                     /\  m.sender.shardId = shardId2 
                                                     /\  m.sender.replicaId = LeaderID(v)                                                              
                             IN
-                            \/  /\  txn1_LeaderReplyOnShard1.logId > txn2_LeaderReplyOnShard1.logId 
-                                /\  txn1_LeaderReplyOnShard2.logId > txn2_LeaderReplyOnShard2.logId
-                            \/  /\  txn1_LeaderReplyOnShard1.logId < txn2_LeaderReplyOnShard1.logId 
-                                /\  txn1_LeaderReplyOnShard2.logId < txn2_LeaderReplyOnShard2.logId
-                                
+                            IF  /\  txn1_LeaderReplyOnShard1.t = txn1_LeaderReplyOnShard2.t 
+                                /\  txn2_LeaderReplyOnShard1.t = txn2_LeaderReplyOnShard2.t 
+                            THEN
+                                \/  /\  txn1_LeaderReplyOnShard1.logId > txn2_LeaderReplyOnShard1.logId 
+                                    /\  txn1_LeaderReplyOnShard2.logId > txn2_LeaderReplyOnShard2.logId
+                                \/  /\  txn1_LeaderReplyOnShard1.logId < txn2_LeaderReplyOnShard1.logId 
+                                    /\  txn1_LeaderReplyOnShard2.logId < txn2_LeaderReplyOnShard2.logId
+                            ELSE
+                                \* if their timestamps are not equal, our coordinator will not consider them as committed, 
+                                \* We do not need to check such cases 
+                                TRUE                                 
                         ELSE TRUE
 ================================================================================
