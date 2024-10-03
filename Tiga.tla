@@ -1441,7 +1441,8 @@ ReleaseSequencer(serverId, currentTime) ==
     IN
     IF  Cardinality(canReleaseTxnIndices) =0  \* Nothing to release
     THEN    
-        /\  UNCHANGED  <<vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum >>     
+        /\  UNCHANGED  <<vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum >>  
+        \* While there is nothing to release, some txns might be speculatively executed   
         /\  IF Cardinality(specTxnIndex) > 0 THEN 
                 Send({[
                     mtype   |-> MFastReply,
@@ -1455,7 +1456,9 @@ ReleaseSequencer(serverId, currentTime) ==
                                 cv  |-> vCrashVector
                                 ],
                     t       |-> sortedTxnList[i].timestamp,
-                    logId   |-> 0 \* logId=0 indicates this is not a speculative txn with rollback risk
+                    logId   |-> 0 \* logId=0 indicates this is a speculative txn with rollback risk, 
+                                  \* we need to compare the timestamps from different shards to decide 
+                                  \* whether the execution results are serializable
                 ]: i \in specTxnIndex })        
             ELSE
                 UNCHANGED <<networkVars>>
@@ -1517,7 +1520,7 @@ ReleaseSequencer(serverId, currentTime) ==
                                 cv  |-> vCrashVector
                                 ],
                     t       |-> sortedTxnList[i].timestamp,
-                    logId   |-> 0 \* logId=0 indicates this is not a speculative txn with rollback risk
+                    logId   |-> 0 \* logId=0 indicates this is a speculative txn with rollback risk
                 ]: i \in specTxnIndex })        
             ELSE
                 TRUE
