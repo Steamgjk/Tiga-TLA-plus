@@ -1431,7 +1431,7 @@ ReleaseSequencer(serverId, currentTime) ==
                 \A j \in 1..i: committingStatus[j] = TRUE } 
         \* Here we consider all txns are not commutative, 
         \* Therefore,  At most one txn can be speculatively executed with risk 
-        \* Refer to RRSE in Section 3.6 
+        \* Refer to Section 3.6 of Tiga paper
         specTxnIndex == {
             i \in 1..Len(sortedTxnList):
                 /\  \A j \in 1..(i-1): committingStatus[j] = TRUE 
@@ -1442,7 +1442,7 @@ ReleaseSequencer(serverId, currentTime) ==
     IF  Cardinality(canReleaseTxnIndices) =0  \* Nothing to release
     THEN    
         /\  UNCHANGED  <<vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum >>  
-        \* While there is nothing to release, some txns might be speculatively executed   
+        \* While there is nothing to release, some txns might be speculatively executed (Section 3.6 of Tiga paper)   
         /\  IF Cardinality(specTxnIndex) > 0 THEN 
                 Send({[
                     mtype   |-> MFastReply,
