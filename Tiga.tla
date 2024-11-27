@@ -308,7 +308,7 @@ MCMCommit == 22
 
     Each server tells its neighbors (the servers in the same region but belong to different shards) its local commit status. This is optional optimization (only for checkpoint and failure recovery acceleration)
     
-    \* maybe obsolete
+    \* [Optional Optimization]
     PeerShardCommitStatus =[ 
         mtype       |-> MPeerShardCommitStatus,
         sender      |-> src \in Servers,
