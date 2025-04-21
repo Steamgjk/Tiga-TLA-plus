@@ -58,7 +58,6 @@ FastQuorums == {R \in SUBSET(Replicas) :
 Quorums == {R \in SUBSET(Replicas) : 
                 Cardinality(R) * 2 > Cardinality(Replicas)}   
 
-
 (* `^\textbf{\large Server Status}^' *)
 StNormal == 1
 StViewChange == 2
@@ -146,6 +145,7 @@ MCMCommit == 22
         sender  |-> src \in Servers,
         dest    |-> dst \in Servers,
         entry   |-> LogEntry
+        round   |-> 1 or 2  # there can be at most 2 rounds of Timestamp Agreement
     ]
 
     After leader has released the txn, it synchornizes the log with its followers. If followers are inconsistent, they will rectify their logs to keey consistent with leader
@@ -193,7 +193,9 @@ MCMCommit == 22
         dest    |-> dst \in Servers,
         gView   |-> 0..x
         gVec    |-> the lViews for each shard
-    ]
+        gMode   |-> 1 represents Preventive Mode, i.e., first do timestamp agreement, then exectuion
+                    2 represents Detective Mode, i.e., first do execuion, then timestamp agreement
+     ]
 
     ViewChange = [ 
         mtype       |-> MViewChange,
@@ -201,6 +203,7 @@ MCMCommit == 22
         dest        |-> dst \in Servers,
         gView       |-> 0..x
         gVec        |-> the lViews for each shard
+        gMode       |-> 1 or 2
         lView       |-> 0..x
         lastNormal  |-> v \in ViewIDs,
         lSyncPoint  |-> 0..
@@ -362,15 +365,25 @@ VARIABLES
             (* Messages that have been processed by servers 
             *)
             vServerProcessed, 
+
+            (* The mode to use for servers in this view
+            * 1 represent Preventive Mode: timestamp agreement before execution
+            * 2 represents Detective Mode: execution before timestamp agreement
+            *)
+            vMode,
+
             (* Log list of entries 
             *)
-            vLog,            
-            (* The sequencer to hold txns and release it after clock passes its timestamp (s+l) 
+            vLog,   
+
+            (* The priority queue to hold txns and release it after clock passes its timestamp (s+l) 
             *)
-            vEarlyBuffer, 
-            (* The buffer to hold txns on followers because these txns come too late and cannot enter early-buffer 
+            vPQ, 
+            
+            (* The buffer to hold txns that cannot enter vLog or vPQ, but is still located on this server
             *)
-            vLateBuffer,     
+            vBuffer,     
+
             (* Each leader server has a data structure of TimestampQuroum to collect the timestamps from other servers for agreement 
             *)
             vTimestampQuorum,
@@ -378,39 +391,51 @@ VARIABLES
             (* One of StNormal, StViewChange, StFailing, StCrossShardSyncing, StRecovering  
             *)
             vServerStatus,
+            
             (* Global views of each server 
             *) 
             vGView,
+            
             (* The g-vecs of each server 
             *)
             vGVec,
+            
             (* Local views of each server 
             *)
             vLView,  
+            
             (* Current Time of the server 
             *)
             vServerClock,   
+            
             (* Last lView in which this server had StNormal status 
             *)
             vLastNormView,   
+            
             (* Used for collecting view change votes 
             *)
             vViewChange,  
+            
             (* Used for collecting CrossShardVerify replies. After the leader have recovered their logs for its own shard, they need verify from the other shards to ensure the recovered logs satisfy strict serializability, i.e., every log has commonly-agreed timestamps across sharding groups. 
             *)
             vCrossShardVerifyReps,
+            
             (* vLSyncPoint indicates to which the server state (vLog) is consistent with the leader.  
             *)
             vLSyncPoint,
+            
             (* vLCommitPoint indicates that the log entries before this point has been locally committed, i.e., replicated to majority in this sharding groups. So followers can safely execute the logged txns 
             *)
             vLCommitPoint, 
+            
             (* vLSyncQuorum is used by each leader to collect the LocalSyncStatus messages from servers in the same sharding group 
             *)
             vLSyncQuorum,  
+            
             (* Locally unique string (for CrashVectorReq) 
             *)          
             vUUIDCounter,   
+            
             (* CrashVector, initialized as all-zero vector 
             *)
             vCrashVector,    
@@ -454,7 +479,7 @@ VARIABLES  ActionName
 networkVars == << messages >>
 
 serverStateVars == 
-    << vLog, vEarlyBuffer, vLateBuffer, 
+    << vLog, vPQ, vBuffer, 
     vTimestampQuorum, vCrossShardVerifyReps, vServerStatus, 
     vGView, vGVec, vLView, vServerClock, vLastNormView, 
     vViewChange, vLSyncPoint, vLCommitPoint, 
@@ -472,9 +497,10 @@ InitNetworkState == messages = {}
 
 InitServerState ==
     /\  vServerProcessed = [ serverId \in Servers |-> {} ]
+    /\  vMode = [ serverId \in Servers |-> 1 ] \* Use Preventive Mode by default
     /\  vLog = [ serverId \in Servers |-> << >> ]
-    /\  vEarlyBuffer   = [ serverId \in Servers |-> {} ]
-    /\  vLateBuffer   = [ serverId \in Servers |-> {} ]
+    /\  vPQ   = [ serverId \in Servers |-> {} ]
+    /\  vBuffer   = [ serverId \in Servers |-> {} ]
     /\  vTimestampQuorum  =   [ serverId \in Servers |-> {} ]
     /\  vCrossShardVerifyReps = [ serverId \in Servers |-> {} ]
     /\  vServerStatus    =   [ serverId \in Servers |-> StNormal ]
@@ -588,6 +614,14 @@ SetToSortSeq(S, op(_,_)) ==
 
 \* `^\textbf{View ID Helpers}^' 
 
+(* Given a shard list, pick randomly the shard-ids to initialize the txn
+*)
+RandomIncreasingSeq(shardSeq) ==
+  CHOOSE s \in Seq(shardSeq) :
+    /\ s # << >>                          \* not empty
+    /\ \A i \in 1..(Len(s) - 1) : s[i] < s[i+1]
+    /\ \A x \in s : x \in shardSeq
+
 LeaderID(viewId) == ReplicaOrder[ (viewId % Len(ReplicaOrder)) +1]  \* remember <<>> are 1-indexed    
 
 isLeader(replicaId, viewId) == (replicaId = LeaderID(viewId))
@@ -633,18 +667,24 @@ CoordSubmitTxn(c)   ==
             txnId == [
                 coordId |-> c,
                 rId     |-> Cardinality(vCoordTxns[c])+1
-            ]
+            ],
+            targetShardIds == RandomIncreasingSeq(Shards),
+            targetServerIds == {
+                    [
+                        replicaId |-> e[1],
+                        shardId |-> e[2]
+                    ]: e \in Replicas \X targetShardIds
+            }
         IN                        
         /\  Send({[ mtype   |-> MTxn,
                 txnId   |-> txnId,
                 command |-> "",
-                \* Here we assume involves all shards
-                shards  |-> Shards,
+                shards  |-> targetShardIds,
                 st      |-> vCoordClock[c], 
                 bound   |-> LatencyBounds[c],
                 sender  |-> c, 
                 dest    |-> serverId
-            ]: serverId \in Servers })
+            ]: serverId \in targetServerIds })
         /\ vCoordClock' = [ vCoordClock EXCEPT ![c] = vCoordClock[c] + 1 ]
         /\ vCoordTxns' = [ vCoordTxns EXCEPT ![c] = vCoordTxns[c] \cup {txnId} ]
 
@@ -662,9 +702,9 @@ HandleTxn(m) ==
         serversInOneReplica == {s \in Servers: s.replicaId = myServerId.replicaId} 
     IN
     \/  /\ isLeader(myServerId.replicaId, vLView[myServerId])
-        /\ vEarlyBuffer' = [
-            vEarlyBuffer EXCEPT ![myServerId]
-                = vEarlyBuffer[myServerId] \cup {newLog}]
+        /\ vPQ' = [
+            vPQ EXCEPT ![myServerId]
+                = vPQ[myServerId] \cup {newLog}]
         \* Broadcast timestamp notifications to other shards
         /\ Send({[
             mtype   |-> MTimestampNotification,
@@ -674,20 +714,20 @@ HandleTxn(m) ==
             dest    |-> dstServerId,
             entry   |-> newLog
             ]: dstServerId \in serversInOneReplica })
-        /\  UNCHANGED  << vLateBuffer >>
+        /\  UNCHANGED  << vBuffer >>
     \/  /\  ~isLeader(myServerId.replicaId, vLView[myServerId])
         /\  \/  /\ newLog.timestamp = (m.st + m.bound)
-                /\ vEarlyBuffer' = [
-                        vEarlyBuffer EXCEPT ![myServerId]
-                            = vEarlyBuffer[myServerId] \cup {newLog}
+                /\ vPQ' = [
+                        vPQ EXCEPT ![myServerId]
+                            = vPQ[myServerId] \cup {newLog}
                     ]
-                /\  UNCHANGED << vLateBuffer >>
+                /\  UNCHANGED << vBuffer >>
             \/  /\ ~(newLog.timestamp = (m.st + m.bound))
-                /\   vLateBuffer' = [
-                        vLateBuffer EXCEPT ![myServerId]
-                            = vLateBuffer[myServerId] \cup {newLog}
+                /\   vBuffer' = [
+                        vBuffer EXCEPT ![myServerId]
+                            = vBuffer[myServerId] \cup {newLog}
                     ]
-                /\  UNCHANGED  << vEarlyBuffer >>
+                /\  UNCHANGED  << vPQ >>
         /\ UNCHANGED  << networkVars >>
 
 
@@ -719,18 +759,18 @@ HandleTimestampNotification(m) ==
                         \A y \in quorum: 
                             y.entry.timestamp <= x.entry.timestamp 
                 sequencingTxn == 
-                    CHOOSE x \in vEarlyBuffer[myServerId]: 
+                    CHOOSE x \in vPQ[myServerId]: 
                         x.txnId = m.entry.txnId  
             IN
             IF maxTimestampTxn.entry.timestamp > sequencingTxn.timestamp 
             THEN 
-                vEarlyBuffer' = [ vEarlyBuffer EXCEPT ![myServerId] 
-                    = (vEarlyBuffer[myServerId] \ {sequencingTxn}) \cup {maxTimestampTxn.entry} ]
-            ELSE UNCHANGED  << vEarlyBuffer >>
+                vPQ' = [ vPQ EXCEPT ![myServerId] 
+                    = (vPQ[myServerId] \ {sequencingTxn}) \cup {maxTimestampTxn.entry} ]
+            ELSE UNCHANGED  << vPQ >>
         
         ELSE    
         (* Timestamp quorum not sufficient so far: do not take further actions *)
-            UNCHANGED  << vEarlyBuffer >>
+            UNCHANGED  << vPQ >>
         
             
 
@@ -749,16 +789,16 @@ HandleInterReplicaSync(m) ==
             /\  vLog' = [vLog EXCEPT ![myServerId] = m.entries]
             (* Kick synced entries out of earlyBuffer 
             *)
-            /\  vEarlyBuffer' = [ 
-                    vEarlyBuffer EXCEPT ![myServerId] 
-                        =  { msg \in vEarlyBuffer[myServerId]: 
+            /\  vPQ' = [ 
+                    vPQ EXCEPT ![myServerId] 
+                        =  { msg \in vPQ[myServerId]: 
                             msg.txnId \notin syncedTxnIds }
                 ]
             (* Kick synced entries out of late buffer. In actual implementation, InterReplicaSync only carries log indices, and the entries are fetched from Late Buffer first, if still missing, then it will go to ask leader. Such a design can save much unncessary transmission in practice.
             *)
-            /\  vLateBuffer' = [ 
-                    vLateBuffer EXCEPT ![myServerId] 
-                        =  { msg \in vLateBuffer[myServerId]: 
+            /\  vBuffer' = [ 
+                    vBuffer EXCEPT ![myServerId] 
+                        =  { msg \in vBuffer[myServerId]: 
                             msg.txnId \notin syncedTxnIds }
                 ]
             (* Kick synced entries out of timestamp quorum. These txns have been synced, no need to record in TimestampQuorum
@@ -783,8 +823,8 @@ HandleInterReplicaSync(m) ==
                 ]: i \in (currentSyncPoint+1)..Len(m.entries) })
         \/  /\  currentSyncPoint >= Len(m.entries)
             \* Noting new to sync
-            /\  UNCHANGED << networkVars, vLog, vEarlyBuffer, 
-                            vLateBuffer, vTimestampQuorum, vLSyncPoint>>
+            /\  UNCHANGED << networkVars, vLog, vPQ, 
+                            vBuffer, vTimestampQuorum, vLSyncPoint>>
 
 
 
@@ -948,12 +988,12 @@ HandleViewChangeReq(m) ==
             vLView EXCEPT ![myServerId] = m.gVec[myServerId.shardId]
         ]
     \* Clear ealry buffer, 
-    /\  vEarlyBuffer' = [
-            vEarlyBuffer EXCEPT ![myServerId] = {}
+    /\  vPQ' = [
+            vPQ EXCEPT ![myServerId] = {}
         ]
     \* Clear late buffer 
-    /\  vLateBuffer' = [
-            vLateBuffer EXCEPT ![myServerId] = {}
+    /\  vBuffer' = [
+            vBuffer EXCEPT ![myServerId] = {}
         ]
     \* Clear timestamp quorum
     /\  vTimestampQuorum' = [
@@ -1165,8 +1205,8 @@ HandleStartView(m) ==
     /\  vGVec' = [ vGVec EXCEPT ![myServerId] = m.vGVec ]
     /\  vServerStatus' = [ vServerStatus EXCEPT ![myServerId] = StNormal]
     /\  vLog' = [vLog EXCEPT ![myServerId] = m.entries]
-    /\  vEarlyBuffer' = [ vEarlyBuffer EXCEPT ![myServerId] = {} ]
-    /\  vLateBuffer' = [ vLateBuffer EXCEPT ![myServerId] = {} ]
+    /\  vPQ' = [ vPQ EXCEPT ![myServerId] = {} ]
+    /\  vBuffer' = [ vBuffer EXCEPT ![myServerId] = {} ]
     /\  vTimestampQuorum' = [ vTimestampQuorum EXCEPT ![myServerId] = {} ]
     /\  vCrossShardVerifyReps' = [
             vCrossShardVerifyReps EXCEPT ![myServerId] = {}
@@ -1181,8 +1221,8 @@ HandleStartView(m) ==
 
 ResetServerState(serverId) ==
     /\  vLog' = [vLog EXCEPT ![serverId] = <<>>]
-    /\  vEarlyBuffer' = [ vEarlyBuffer EXCEPT ![serverId] = {}]
-    /\  vLateBuffer' = [vLateBuffer EXCEPT ![serverId] = {}]
+    /\  vPQ' = [ vPQ EXCEPT ![serverId] = {}]
+    /\  vBuffer' = [vBuffer EXCEPT ![serverId] = {}]
     /\  vTimestampQuorum' = [vTimestampQuorum EXCEPT ![serverId] = {}]
     /\  vCrossShardVerifyReps' = [ 
             vCrossShardVerifyReps EXCEPT ![serverId] = {} 
@@ -1419,7 +1459,7 @@ ReleaseSequencer(serverId, currentTime) ==
     LET
         serversInOneShard == { s \in Servers: s.shardId = serverId.shardId }
         expireTxns == 
-            { msg \in vEarlyBuffer[serverId]:
+            { msg \in vPQ[serverId]:
                 /\ msg.timestamp <= currentTime }
         sortedTxnList == SetToSortSeq(expireTxns, Compare)
         committingStatus == 
@@ -1441,7 +1481,7 @@ ReleaseSequencer(serverId, currentTime) ==
     IN
     IF  Cardinality(canReleaseTxnIndices) =0  \* Nothing to release
     THEN    
-        /\  UNCHANGED  <<vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum >>  
+        /\  UNCHANGED  <<vLog, vPQ, vBuffer, vTimestampQuorum >>  
         \* While there is nothing to release, some txns might be speculatively executed (Section 3.6 of Tiga paper)   
         /\  IF Cardinality(specTxnIndex) > 0 THEN 
                 Send({[
@@ -1469,9 +1509,9 @@ ReleaseSequencer(serverId, currentTime) ==
             releaseSeq == SubSeq(sortedTxnList, 1, releaseUpTo)
             releaseTxns ==  {releaseSeq[i]: i \in 1..Len(releaseSeq)}
         IN
-        /\ vEarlyBuffer' =[
-            vEarlyBuffer EXCEPT ![serverId] 
-                = vEarlyBuffer[serverId] \ releaseTxns ]
+        /\ vPQ' =[
+            vPQ EXCEPT ![serverId] 
+                = vPQ[serverId] \ releaseTxns ]
         /\ vTimestampQuorum' = [
             vTimestampQuorum EXCEPT ![serverId]
                 = { msg \in vTimestampQuorum[serverId]: 
@@ -1536,8 +1576,8 @@ ServerClockMove(serverId) ==
         /\  IF  vServerStatus[serverId] = StNormal THEN
                 /\  ReleaseSequencer(serverId, vServerClock[serverId] +1)
             ELSE    
-                UNCHANGED <<networkVars, vLog, vEarlyBuffer, 
-                    vLateBuffer, vTimestampQuorum>>
+                UNCHANGED <<networkVars, vLog, vPQ, 
+                    vBuffer, vTimestampQuorum>>
         /\  UNCHANGED << vCrossShardVerifyReps,
                 vServerStatus, vGView, vGVec, vLView, vLastNormView,
                 vViewChange, vLSyncPoint, vLCommitPoint, 
@@ -1595,7 +1635,7 @@ Next ==
             vServerProcessed[m.dest] \cup {m} ]
         /\ HandleTimestampNotification(m)
         /\ UNCHANGED  << networkVars, coordStateVars, configManagerStateVars, 
-                vLog, vCrossShardVerifyReps, vLateBuffer, vServerStatus, 
+                vLog, vCrossShardVerifyReps, vBuffer, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, vLSyncQuorum, 
                 vUUIDCounter, vCrashVector, vCrashVectorReps, vRecoveryReps>>
@@ -1609,7 +1649,7 @@ Next ==
             vServerProcessed[m.dest] \cup {m} ]
         /\ HandleInterReplicaSync(m)
         /\ UNCHANGED << coordStateVars, configManagerStateVars,
-                vLog,  vCrossShardVerifyReps, vLateBuffer, 
+                vLog,  vCrossShardVerifyReps, vBuffer, 
                 vServerStatus, vGView, vGVec, vLView, 
                 vServerClock, vLastNormView, 
                 vViewChange, vLCommitPoint, 
@@ -1625,7 +1665,7 @@ Next ==
         /\ vServerStatus[serverId] = StNormal
         /\ StartLeaderFail(serverId)
         /\ UNCHANGED << networkVars, coordStateVars, configManagerStateVars, 
-            vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum, 
+            vLog, vPQ, vBuffer, vTimestampQuorum, 
             vCrossShardVerifyReps, vGView, vGVec, vLView, vServerClock, 
             vLastNormView, vViewChange, vLSyncPoint, vLCommitPoint, 
             vLSyncQuorum, vUUIDCounter, vCrashVector, vCrashVectorReps, 
@@ -1710,7 +1750,7 @@ Next ==
         /\  vServerStatus[m.dest] = StCrossShardSyncing
         /\  HandleCrossShardVerifyReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum, 
+                vLog, vPQ, vBuffer, vTimestampQuorum, 
                 vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, vLSyncQuorum,
@@ -1727,7 +1767,7 @@ Next ==
         /\  vServerStatus[m.dest] = StCrossShardSyncing
         /\  HandleCrossShardVerifyRep(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vEarlyBuffer, vLateBuffer, vTimestampQuorum, vServerStatus, 
+                vPQ, vBuffer, vTimestampQuorum, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, 
                 vLSyncQuorum, vUUIDCounter, vCrashVector, 
@@ -1764,7 +1804,7 @@ Next ==
         /\  vServerStatus[m.dest] = StNormal
         /\  HandleCrashVectorReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum, 
+                vLog, vPQ, vBuffer, vTimestampQuorum, 
                 vCrossShardVerifyReps, vServerStatus, vGView, vGVec,
                 vLView, vServerClock, vLastNormView, vViewChange, 
                 vLSyncPoint, vLCommitPoint, vLSyncQuorum, vUUIDCounter, 
@@ -1779,7 +1819,7 @@ Next ==
         /\  vServerStatus[m.dest] = StRecovering
         /\  HandleCrashVectorRep(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, 
+                vLog, vPQ, vBuffer, 
                 vTimestampQuorum, vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint,vLSyncQuorum,
@@ -1795,7 +1835,7 @@ Next ==
         /\  isCrashVectorValid(m)
         /\  HandleRecoveryReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, 
+                vLog, vPQ, vBuffer, 
                 vTimestampQuorum, vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, vLastNormView, 
                 vViewChange, vLSyncPoint, vLCommitPoint, vLSyncQuorum,
@@ -1811,7 +1851,7 @@ Next ==
         /\  isCrashVectorValid(m)
         /\  HandleRecoveryRep(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, 
+                vLog, vPQ, vBuffer, 
                 vTimestampQuorum, vCrossShardVerifyReps, vServerStatus, 
                 vGVec, vServerClock, vLastNormView, vViewChange, 
                 vLSyncPoint, vLCommitPoint, vLSyncQuorum,
@@ -1827,7 +1867,7 @@ Next ==
         /\  isCrashVectorValid(m)
         /\  HandleStartViewReq(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum, 
+                vLog, vPQ, vBuffer, vTimestampQuorum, 
                 vCrossShardVerifyReps, vServerStatus, 
                 vGView, vGVec, vLView, vServerClock, 
                 vLastNormView, vViewChange, vLSyncPoint, 
@@ -1853,7 +1893,7 @@ Next ==
         /\  isCrashVectorValid(m)
         /\  HandleLocalSyncStatus(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                vLog, vEarlyBuffer, vLateBuffer, vTimestampQuorum, 
+                vLog, vPQ, vBuffer, vTimestampQuorum, 
                 vCrossShardVerifyReps, vServerClock, vViewChange, 
                 vGVec, vGView, vLSyncPoint, vLView, vLastNormView,
                 vServerStatus,vUUIDCounter, vCrashVectorReps, 
@@ -1870,7 +1910,7 @@ Next ==
         /\  isCrashVectorValid(m)
         /\  HandleLocalCommit(m)
         /\  UNCHANGED  << coordStateVars, configManagerStateVars,
-                networkVars, vLog, vEarlyBuffer, vLateBuffer, 
+                networkVars, vLog, vPQ, vBuffer, 
                 vTimestampQuorum, vCrossShardVerifyReps, 
                 vServerStatus, vServerClock, vGView, vGVec, 
                 vLView, vLastNormView, vViewChange, vLSyncPoint, 
