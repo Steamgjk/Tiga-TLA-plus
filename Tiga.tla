@@ -66,6 +66,23 @@ StRecovering == 4
 StFailing == 5
 
 
+(* `^\textbf{\large Mode adopted by servers in this view}^' *)
+MdPreventive == 1
+MdDetective == 2
+
+(* `^\textbf{\large Txn Status }^' *)
+TSInitial == 1
+TSR1Start == 2  \* The first round of timestamp agreement has started
+TSR1Complete == 3 \* The first round of timestamp agreement has completed
+TSR2Start == 4 \* The second round of timestamp agreement has started
+TSR2Complete == 5 \* The second round of timestamp agreement has completed
+
+
+(* `^\textbf{\large Status of Txn at the head of vPQ}^' *)
+vHSInitial == 1
+vHSExec == 2
+
+
 (* `^\textbf{\large Message Types}^' *)
 MTxn == 1
 MLogEntry == 2  \* Log entry, different from index, it includes command field, which can be large in practice
@@ -367,7 +384,7 @@ VARIABLES
             vServerProcessed, 
 
             (* The mode to use for servers in this view
-            * 1 represent Preventive Mode: timestamp agreement before execution
+            * 1 represents Preventive Mode: timestamp agreement before execution
             * 2 represents Detective Mode: execution before timestamp agreement
             *)
             vMode,
@@ -376,9 +393,18 @@ VARIABLES
             *)
             vLog,   
 
+            (* Last executed txn's timestamp, it is used to decide
+            *  whether an incoming txn can enter vPQ
+            *)
+            vLastExecutedTimestamp,
+
             (* The priority queue to hold txns and release it after clock passes its timestamp (s+l) 
             *)
             vPQ, 
+
+            (* The status of the head txn at vPQ,i.e., vHSInitial/vHSExec
+            *)
+            vHeadStatus,
             
             (* The buffer to hold txns that cannot enter vLog or vPQ, but is still located on this server
             *)
@@ -479,7 +505,7 @@ VARIABLES  ActionName
 networkVars == << messages >>
 
 serverStateVars == 
-    << vLog, vPQ, vBuffer, 
+    << vLog, vPQ, vHeadStatus, vBuffer, 
     vTimestampQuorum, vCrossShardVerifyReps, vServerStatus, 
     vGView, vGVec, vLView, vServerClock, vLastNormView, 
     vViewChange, vLSyncPoint, vLCommitPoint, 
@@ -497,9 +523,11 @@ InitNetworkState == messages = {}
 
 InitServerState ==
     /\  vServerProcessed = [ serverId \in Servers |-> {} ]
-    /\  vMode = [ serverId \in Servers |-> 1 ] \* Use Preventive Mode by default
+    /\  vMode = [ serverId \in Servers |-> MdPreventive ] \* Use Preventive Mode by default
     /\  vLog = [ serverId \in Servers |-> << >> ]
+    /\  vLastExecutedTimestamp = [ serverId \in Servers |-> 0 ]
     /\  vPQ   = [ serverId \in Servers |-> {} ]
+    /\  vHeadStatus = [ serverId \in Servers |-> vHSInitial ]
     /\  vBuffer   = [ serverId \in Servers |-> {} ]
     /\  vTimestampQuorum  =   [ serverId \in Servers |-> {} ]
     /\  vCrossShardVerifyReps = [ serverId \in Servers |-> {} ]
@@ -689,6 +717,32 @@ CoordSubmitTxn(c)   ==
         /\ vCoordTxns' = [ vCoordTxns EXCEPT ![c] = vCoordTxns[c] \cup {txnId} ]
 
 
+TxnIdLessThan(txnId1, txnId2) ==
+    IF txnId1.rId < txnId2.rId THEN 
+        TRUE 
+    ELSE 
+        IF txnId1.rId = txnId2.rId THEN 
+            IF txnId.coordId < txnId.coordId THEN 
+                TRUE 
+            ELSE 
+                FALSE 
+        ELSE 
+            FALSE  
+
+TxnLessThan(txn1, txn2) ==
+    IF txn1.timestamp < txn2.timestamp THEN 
+        TRUE 
+    ELSE 
+        IF txn1.timestamp = txn2.timestamp THEN 
+            IF TxnIdLessThan(txn1.txnId, txn2.txnId) THEN 
+                TRUE 
+            ELSE 
+                FALSE 
+        ELSE 
+            FALSE
+
+
+
 HandleTxn(m) == 
     LET 
         myServerId == m.dest
@@ -697,38 +751,44 @@ HandleTxn(m) ==
             txnId   |-> m.txnId,
             command |-> m.command,
             shards  |-> m.shards,
-            timestamp|-> Max(LastAppendedTimestamp(vLog[myServerId]), m.st + m.bound)
+            timestamp|-> m.st + m.bound,
+            status |-> TSInitial
         ]
         serversInOneReplica == {s \in Servers: s.replicaId = myServerId.replicaId} 
     IN
-    \/  /\ isLeader(myServerId.replicaId, vLView[myServerId])
-        /\ vPQ' = [
-            vPQ EXCEPT ![myServerId]
-                = vPQ[myServerId] \cup {newLog}]
-        \* Broadcast timestamp notifications to other shards
-        /\ Send({[
-            mtype   |-> MTimestampNotification,
-            gView   |-> vGView[myServerId],
-            lView   |-> vLView[myServerId],
-            sender  |-> myServerId,
-            dest    |-> dstServerId,
-            entry   |-> newLog
-            ]: dstServerId \in serversInOneReplica })
+    IF newLog.timestamp > vLastExecutedTimestamp[myServerId] THEN 
+        \* Can enter PQ
+        /\  vPQ' = [
+                vPQ EXCEPT ![myServerId]
+                    = vPQ[myServerId] \cup {newLog}
+            ]
         /\  UNCHANGED  << vBuffer >>
-    \/  /\  ~isLeader(myServerId.replicaId, vLView[myServerId])
-        /\  \/  /\ newLog.timestamp = (m.st + m.bound)
-                /\ vPQ' = [
-                        vPQ EXCEPT ![myServerId]
-                            = vPQ[myServerId] \cup {newLog}
-                    ]
-                /\  UNCHANGED << vBuffer >>
-            \/  /\ ~(newLog.timestamp = (m.st + m.bound))
-                /\   vBuffer' = [
-                        vBuffer EXCEPT ![myServerId]
-                            = vBuffer[myServerId] \cup {newLog}
-                    ]
-                /\  UNCHANGED  << vPQ >>
-        /\ UNCHANGED  << networkVars >>
+    ELSE
+        \* Cannot directly enter PQ
+        IF isLeader(myServerId.replicaId, vLView[myServerId]) THEN 
+            LET 
+                updatedLog == [
+                    mtype   |-> MLogEntry,
+                    txnId   |-> m.txnId,
+                    command |-> m.command,
+                    shards  |-> m.shards,
+                    \* Update the txn's timestamp as the current clock time
+                    timestamp|-> vServerClock[myServerId],
+                    status |-> TSInitial
+                ]
+            IN 
+            /\  vPQ' = [
+                    vPQ EXCEPT ![myServerId]
+                        = vPQ[myServerId] \cup {updatedLog}
+                ]
+            /\  UNCHANGED  << vBuffer >>
+        ELSE 
+            \* Follower directly put the log into its buffer
+            /\  vBuffer' = [
+                    vBuffer EXCEPT ![myServerId]
+                        = vBuffer[myServerId] \cup {newLog}
+                ]
+            /\  UNCHANGED  << vPQ >>
 
 
 
@@ -1451,33 +1511,34 @@ HandleLocalCommit(m) ==
 
 
 isCommitting(txn, timestampQ) == 
-    LET quorum == { msg \in timestampQ: msg.entry.txnId =txn.txnId}
+    LET quorum == { msg \in timestampQ: msg.entry.txnId =txn.txnId }
     IN  Cardinality(quorum) = Cardinality(txn.shards)
                                 
 
 ReleaseSequencer(serverId, currentTime) == 
     LET
         serversInOneShard == { s \in Servers: s.shardId = serverId.shardId }
-        expireTxns == 
-            { msg \in vPQ[serverId]:
-                /\ msg.timestamp <= currentTime }
-        sortedTxnList == SetToSortSeq(expireTxns, Compare)
+        expiredTxns == 
+            { 
+                msg \in vPQ[serverId]:
+                    /\ msg.timestamp <= currentTime 
+            }
+        sortedTxnList == SetToSortSeq(expiredTxns, Compare)
         committingStatus == 
-            [ i \in 1..Len(sortedTxnList) 
-                |-> isCommitting(sortedTxnList[i], vTimestampQuorum[serverId])
+            [ 
+                i \in 1..Len(sortedTxnList) 
+                    |-> isCommitting(sortedTxnList[i], vTimestampQuorum[serverId])
             ]
         canReleaseTxnIndices == {
             i \in 1..Len(sortedTxnList):
                 \A j \in 1..i: committingStatus[j] = TRUE } 
         \* Here we consider all txns are not commutative, 
         \* Therefore,  At most one txn can be speculatively executed with risk 
-        \* Refer to Section 3.6 of Tiga paper
         specTxnIndex == {
             i \in 1..Len(sortedTxnList):
                 /\  \A j \in 1..(i-1): committingStatus[j] = TRUE 
                 /\  committingStatus[i] = FALSE 
-        }  
-               
+        }    
     IN
     IF  Cardinality(canReleaseTxnIndices) =0  \* Nothing to release
     THEN    
@@ -1567,6 +1628,170 @@ ReleaseSequencer(serverId, currentTime) ==
 
 
 
+DequeueTxn(serverId, nowTime) ==
+    IF Cardinality(vPQ[serverId]) = 0 THEN 
+        \* Nothing to dequeue
+        UNCHANGED  << vPQ >> 
+    ELSE
+        LET
+            headTxn == 
+                CHOOSE txn \in vPQ[serverId]:
+                    \A x \in vPQ[serverId]:
+                        IF x /= txn THEN TxnLessThan(txn, x)
+        IN
+        IF vMode[serverId] = MdPreventive THEN 
+            CASE headTxn.status = TSInitial -> StartRoundOneTimestampAgreement(serverId,headTxn)
+            []   headTxn.status = TSR1Start -> CheckRoundOneTimestampAgreement(serverId,headTxn)
+            []   headTxn.status = TSR1Complete -> CheckRoundOneTimestampQuorum(serverId,headTxn)
+            []   headTxn.status = TSR2Start -> CheckRoundTwoTimestampAgreement(serverId,headTxn)
+            []   headTxn.status = TSR2Complete ->   /\ AppendToLogList(serverId, headTxn) 
+                                                    /\ SendFastReply(serverId, headTxn)
+            []   OTHER -> FALSE
+
+        ELSE \* Detective 
+            CASE headTxn.status = TSInitial ->  /\ SendFastReply(serverId, headTxn) 
+                                                /\ StartRoundOneTimestampAgreement(serverId, headTxn)
+            []   headTxn.status = TSR1Start -> CheckRoundOneTimestampAgreement(serverId,headTxn)
+            []   headTxn.status = TSR1Complete -> CheckRoundOneTimestampQuorum(serverId,headTxn)
+            []   headTxn.status = TSR2Start -> CheckRoundTwoTimestampAgreement(serverId,headTxn)
+            []   headTxn.status = TSR2Complete ->   /\ AppendToLogList(serverId,headTxn) 
+                                                    /\ SendFastReply(serverId, headTxn)
+            []   OTHER -> FALSE            
+
+
+SendFastReply(serverId, txn) == 
+    Send({[
+            mtype   |-> MFastReply,
+            sender  |-> serverId,
+            dest    |-> txn.txnId.coordId,
+            gView   |-> vGView[serverId],
+            lView   |-> vLView[serverId],
+            txnId   |-> txn.txnId,
+            hash    |-> [
+                            log |-> vLog[serverId],
+                            cv  |-> vCrashVector
+                        ],
+            t       |-> txn.timestamp
+        ]})
+    
+
+StartRoundOneTimestampAgreement(serverId, txn) ==
+    LET 
+        \* TLA+ does not support in-place update
+        \* We must create a new entry to replace the old one
+        newTxn == [ txn EXCEPT !.status = TSR1Start ]
+    IN
+    /\  vPQ' = [
+            vPQ EXCEPT ![myServerId]
+                = vPQ[myServerId] \ {txn}  \cup {newTxn}
+        ]
+    /\  BroadcastTimestampNotification(serverId, newTxn, 1)
+
+
+BroadcastTimestampNotification(serverId, txn, roundNumber) ==
+    LET
+        destServers == {[
+                replicaId |-> LeaderID(vLView[serverId]),
+                shardId   |-> sid
+            ]: sid \in txn.shards}
+    IN 
+    /\  Send({[
+            mtype   |-> MTimestampNotification,
+            gView   |-> vGView[serverId],
+            lView   |-> vLView[serverId],
+            sender  |-> serverId,
+            dest    |-> destId
+            entry   |-> txn,
+            round   |-> roundNumber
+        ]: destId \in destServers })
+
+
+CheckRoundOneTimestampAgreement(serverId,txn) ==
+    LET
+        timestampQuorum == {
+            msg \in vTimestampQuorum[serverId] 
+                :   /\ msg.entry.txnId = txn.txnId
+                    /\ msg.gView = vGView[serverId]
+                    /\ msg.lView = vLView[serverId]
+                    /\ msg.round = 1
+        } 
+    IN 
+    IF Cardinality(timestampQuorum) = Cardinality(txn.shards) THEN 
+        \* The quorum is complete
+        LET 
+            newTxn == [txn EXCEPT !.status = TSR1Complete ]
+        IN 
+        vPQ' = [
+            vPQ EXCEPT ![serverId]
+                = vPQ[serverId] \ {txn}  \cup {newTxn}
+        ]
+    ELSE 
+        UNCHANGED  << vPQ >>
+
+
+CheckRoundOneTimestampQuorum(serverId, txn) ==
+    LET
+        timestampQuorum == {
+            msg \in vTimestampQuorum[serverId] 
+                :   /\ msg.entry.txnId = txn.txnId
+                    /\ msg.gView = vGView[serverId]
+                    /\ msg.lView = vLView[serverId]
+                    /\ msg.round = 1
+        } 
+        agreedTime == PickMax({msg.entry.timestamp : msg \in timestampQuorum  })
+    IN 
+    IF txn.timestamp = agreedTime THEN 
+        \* All timestamps match, no need for second round of agreement
+        LET 
+            newTxn == [txn EXCEPT !.status = TSR2Complete]
+        IN 
+        vPQ' = [
+                vPQ EXCEPT ![serverId]
+                    = vPQ[serverId] \ {txn}  \cup {newTxn}
+        ]
+    ELSE 
+        \* Need second round of timestamp agreement
+        LET 
+            newTxn == [txn EXCEPT !.status = TSR2Start, !.timestamp = agreedTime ]
+        IN
+        /\  BroadcastTimestampNotification(serverId, newTxn, 2)
+        /\  vPQ' = [
+                vPQ EXCEPT ![serverId]
+                    = vPQ[serverId] \ {txn}  \cup {newTxn}
+            ]
+
+
+CheckRoundTwoTimestampAgreement(serverId, txn) == 
+    LET
+        timestampQuorum == {
+            msg \in vTimestampQuorum[serverId] 
+                :   /\ msg.entry.txnId = txn.txnId
+                    /\ msg.gView = vGView[serverId]
+                    /\ msg.lView = vLView[serverId]
+                    /\ msg.round = 2
+        } 
+    IN 
+    IF Cardinality(timestampQuorum) = Cardinality(txn.shards) THEN 
+        LET 
+            newTxn == [txn EXCEPT !.status = TSR2Complete]
+        IN 
+        vPQ' = [
+            vPQ EXCEPT ![serverId]
+                = vPQ[serverId] \ {txn}  \cup {newTxn}
+        ]
+    ELSE    UNCHANGED  << vPQ >>
+
+
+AppendToLogList(serverId, txn) ==
+    \* Remove the txn from PQ
+    /\  vPQ' = [
+            vPQ EXCEPT ![serverId] = vPQ[serverId] \ {txn}
+        ]
+    \* Append it to log list
+    /\  vLog' = [
+        vLog EXCEPT ![serverId] = vLog[serverId] \o << txn >>
+    ]
+    
 ServerClockMove(serverId) == 
     IF  vServerClock[serverId] >= MaxTime   THEN 
         UNCHANGED  <<networkVars, serverStateVars>>
@@ -1574,10 +1799,11 @@ ServerClockMove(serverId) ==
         /\  vServerClock' = [ 
                 vServerClock EXCEPT ![serverId] = vServerClock[serverId] +1]
         /\  IF  vServerStatus[serverId] = StNormal THEN
-                /\  ReleaseSequencer(serverId, vServerClock[serverId] +1)
+                /\ DequeueTxn(serverId, vServerClock[serverId] +1)
+                \* /\  ReleaseSequencer(serverId, vServerClock[serverId] +1)
             ELSE    
-                UNCHANGED <<networkVars, vLog, vPQ, 
-                    vBuffer, vTimestampQuorum>>
+                UNCHANGED << networkVars, vLog, vPQ, 
+                    vBuffer, vTimestampQuorum >>
         /\  UNCHANGED << vCrossShardVerifyReps,
                 vServerStatus, vGView, vGVec, vLView, vLastNormView,
                 vViewChange, vLSyncPoint, vLCommitPoint, 
@@ -1618,7 +1844,7 @@ Next ==
         /\ vServerProcessed' =[vServerProcessed EXCEPT ![m.dest]=
             vServerProcessed[m.dest] \cup {m} ]
         /\ HandleTxn(m)
-        /\ UNCHANGED  << coordStateVars, configManagerStateVars,
+        /\ UNCHANGED  << networkVars, coordStateVars, configManagerStateVars,
             vLog,vTimestampQuorum, vCrossShardVerifyReps, 
             vServerStatus, vGView, vGVec,
             vLView, vServerClock, vLastNormView, 
@@ -1657,7 +1883,7 @@ Next ==
                 vCrashVectorReps, vRecoveryReps>>                    
         /\ ActionName' = <<"HandleInterReplicaSync">>
 
-
+(*
     \* Some Leader(s) fail 
     \/ \E serverId \in Servers: 
         /\ vLView[serverId] < MaxViews
@@ -1786,7 +2012,8 @@ Next ==
                     vServerClock,vLCommitPoint, 
                     vUUIDCounter, vCrashVector >>
         /\ ActionName' = << "HandleStartView" >>
-
+*)
+(*
     \* Failed server rejoin                    
     \/ \E serverId \in Servers: 
         /\ vServerStatus[serverId] = StFailing
@@ -1916,7 +2143,7 @@ Next ==
                 vLView, vLastNormView, vViewChange, vLSyncPoint, 
                 vLSyncQuorum, vUUIDCounter, vCrashVectorReps, vRecoveryReps >>
         /\ ActionName' = << "HandleLocalCommit" >>
-
+*)
 
     \* Clock Move
     \/ \E serverId \in Servers: 
@@ -1929,6 +2156,7 @@ Next ==
         /\ UNCHANGED << networkVars, serverStateVars, configManagerStateVars,
             vCoordTxns, vCoordProcessed >>
         /\ ActionName' = << "CoordClockMove">>
+
 
 Spec == Init /\ [][Next]_<<networkVars,serverStateVars, coordStateVars, 
                         configManagerStateVars,ActionName>>
