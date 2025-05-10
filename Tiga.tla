@@ -695,8 +695,8 @@ CoordSubmitTxn(c)   ==
             txnId == [
                 coordId |-> c,
                 rId     |-> Cardinality(vCoordTxns[c])+1
-            ],
-            targetShardIds == RandomIncreasingSeq(Shards),
+            ]
+            targetShardIds == RandomIncreasingSeq(Shards)
             targetServerIds == {
                     [
                         replicaId |-> e[1],
@@ -1638,6 +1638,8 @@ DequeueTxn(serverId, nowTime) ==
                 CHOOSE txn \in vPQ[serverId]:
                     \A x \in vPQ[serverId]:
                         IF x /= txn THEN TxnLessThan(txn, x)
+                        ELSE TRUE
+
         IN
         IF vMode[serverId] = MdPreventive THEN 
             CASE headTxn.status = TSInitial -> StartRoundOneTimestampAgreement(serverId,headTxn)
@@ -1683,7 +1685,7 @@ StartRoundOneTimestampAgreement(serverId, txn) ==
     IN
     /\  vPQ' = [
             vPQ EXCEPT ![myServerId]
-                = vPQ[myServerId] \ {txn}  \cup {newTxn}
+                = (vPQ[myServerId] \ {txn})  \cup {newTxn}
         ]
     /\  BroadcastTimestampNotification(serverId, newTxn, 1)
 
@@ -1700,7 +1702,7 @@ BroadcastTimestampNotification(serverId, txn, roundNumber) ==
             gView   |-> vGView[serverId],
             lView   |-> vLView[serverId],
             sender  |-> serverId,
-            dest    |-> destId
+            dest    |-> destId,
             entry   |-> txn,
             round   |-> roundNumber
         ]: destId \in destServers })
@@ -1723,7 +1725,7 @@ CheckRoundOneTimestampAgreement(serverId,txn) ==
         IN 
         vPQ' = [
             vPQ EXCEPT ![serverId]
-                = vPQ[serverId] \ {txn}  \cup {newTxn}
+                = (vPQ[serverId] \ {txn})  \cup {newTxn}
         ]
     ELSE 
         UNCHANGED  << vPQ >>
@@ -1747,7 +1749,7 @@ CheckRoundOneTimestampQuorum(serverId, txn) ==
         IN 
         vPQ' = [
                 vPQ EXCEPT ![serverId]
-                    = vPQ[serverId] \ {txn}  \cup {newTxn}
+                    = (vPQ[serverId] \ {txn})  \cup {newTxn}
         ]
     ELSE 
         \* Need second round of timestamp agreement
@@ -1757,7 +1759,7 @@ CheckRoundOneTimestampQuorum(serverId, txn) ==
         /\  BroadcastTimestampNotification(serverId, newTxn, 2)
         /\  vPQ' = [
                 vPQ EXCEPT ![serverId]
-                    = vPQ[serverId] \ {txn}  \cup {newTxn}
+                    = (vPQ[serverId] \ {txn})  \cup {newTxn}
             ]
 
 
@@ -1777,7 +1779,7 @@ CheckRoundTwoTimestampAgreement(serverId, txn) ==
         IN 
         vPQ' = [
             vPQ EXCEPT ![serverId]
-                = vPQ[serverId] \ {txn}  \cup {newTxn}
+                = (vPQ[serverId] \ {txn})  \cup {newTxn}
         ]
     ELSE    UNCHANGED  << vPQ >>
 
@@ -1789,8 +1791,8 @@ AppendToLogList(serverId, txn) ==
         ]
     \* Append it to log list
     /\  vLog' = [
-        vLog EXCEPT ![serverId] = vLog[serverId] \o << txn >>
-    ]
+            vLog EXCEPT ![serverId] = vLog[serverId] \o << txn >>
+        ]
     
 ServerClockMove(serverId) == 
     IF  vServerClock[serverId] >= MaxTime   THEN 

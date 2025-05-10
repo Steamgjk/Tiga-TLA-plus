@@ -11,7 +11,7 @@
    11  sudo apt install default-jre
    12  sudo apt-get update
    13  sudo apt install default-jre
-   14  java --version
+   14  java -version
    15  sudo apt install texlive-full
    16  git status
    17  git checkout -b "Tiga-WIP"
